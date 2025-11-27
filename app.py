@@ -1,14 +1,12 @@
 import os
 import logging
-import asyncio
 import re
 from dotenv import load_dotenv
-from telegram import Bot, ReplyKeyboardMarkup
+import telegram
+from telegram import ReplyKeyboardMarkup
 from flask import Flask, request, jsonify
 import requests
-import json
 import time
-import threading
 
 load_dotenv()
 
@@ -40,224 +38,159 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class TelegramMiddleware:
+class TelegramBot:
     def __init__(self):
-        # Initialize bot components
         self.bot = None
         self.access_token = None
         self.token_expiry = 0
-        self.loop = None
         self.initialize_bot()
-        logger.info("🚀 Telegram-Salesforce Middleware Started")
+        logger.info("🚀 Telegram-Salesforce Bot Started")
     
     def initialize_bot(self):
-        """Initialize bot components with error handling"""
+        """Initialize bot with error handling"""
         try:
-            # Create bot
-            self.bot = Bot(token=BOT_TOKEN)
-            
-            # Create and set event loop
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-            
+            self.bot = telegram.Bot(token=BOT_TOKEN)
             logger.info("✅ Bot initialized successfully")
         except Exception as e:
             logger.error(f"❌ Failed to initialize bot: {e}")
     
-    def run_async(self, coroutine):
-        """Run async coroutine in the event loop"""
+    def send_message(self, chat_id, message, attachment_url=None):
+        """Send message to Telegram user"""
         try:
-            return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result(timeout=30)
-        except Exception as e:
-            logger.error(f"❌ Async operation failed: {e}")
-            return None
-    
-    def handle_start_command(self, chat_id, user_data):
-        """Handle /start command"""
-        try:
-            logger.info(f"👤 Handling start for user: {user_data.get('first_name', 'Unknown')} (ID: {chat_id})")
-            
-            # Check if this Chat ID is already registered
-            existing_contact = self.find_contact_by_chat_id(chat_id)
-            
-            if existing_contact:
-                contact_name = existing_contact.get('Name', 'Valued Customer')
-                self.run_async(
-                    self.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"👋 Welcome back, {contact_name}!\n\nYou're already registered for promotions."
-                    )
-                )
-                return
-            
-            # New user - ask for phone number to find their Contact
-            keyboard = [
-                ["📱 Share Phone Number", "📧 Enter Email Address"],
-                ["❌ I don't have an account"]
-            ]
-            
-            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-            
-            self.run_async(
-                self.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"👋 Welcome to Bank of Abyssinia, {user_data.get('first_name', 'there')}!\n\n"
-                         "To connect with your existing account and receive personalized promotions, "
-                         "please share your phone number or email address.",
-                    reply_markup=reply_markup
-                )
-            )
-            
-        except Exception as e:
-            logger.error(f"❌ Error handling start command: {e}")
-    
-    def handle_text_message(self, chat_id, message_text, user_data):
-        """Handle text messages"""
-        try:
-            if message_text == "❌ I don't have an account":
-                self.run_async(
-                    self.bot.send_message(
-                        chat_id=chat_id,
-                        text="Please contact our customer support to create an account first."
-                    )
-                )
-                return
-            
-            if message_text in ["📱 Share Phone Number", "📧 Enter Email Address"]:
-                if message_text == "📱 Share Phone Number":
-                    self.run_async(
-                        self.bot.send_message(
-                            chat_id=chat_id,
-                            text="Please enter your phone number:\n\nExamples: 0912121212, 0712121212, 912121212, +251912121212"
-                        )
-                    )
-                else:
-                    self.run_async(
-                        self.bot.send_message(
-                            chat_id=chat_id,
-                            text="Please enter your email address:"
-                        )
-                    )
-                return
-            
-            # Check if message is a phone number
-            if self.is_phone_number(message_text):
-                logger.info(f"📞 Received phone: {message_text} from {chat_id}")
-                
-                # Extract last 9 digits for matching
-                last_9_digits = self.extract_last_9_digits(message_text)
-                
-                contact_record = self.find_contact_by_phone(last_9_digits)
-                
-                if contact_record:
-                    success = self.update_contact_chat_id(contact_record['Id'], chat_id, user_data)
-                    if success:
-                        contact_name = contact_record.get('Name', 'Valued Customer')
-                        self.run_async(
-                            self.bot.send_message(
-                                chat_id=chat_id,
-                                text=f"✅ Successfully connected, {contact_name}! You'll receive promotions soon."
-                            )
-                        )
-                    else:
-                        self.run_async(
-                            self.bot.send_message(
-                                chat_id=chat_id,
-                                text="❌ Connection failed. Please try again."
-                            )
-                        )
-                else:
-                    # No Contact found - create new one
-                    success = self.create_new_contact(
-                        first_name=user_data.get('first_name', 'Telegram'),
-                        last_name=user_data.get('last_name', 'User'),
-                        phone_number=message_text,
-                        chat_id=chat_id,
-                        user_data=user_data
-                    )
-                    
-                    if success:
-                        self.run_async(
-                            self.bot.send_message(
-                                chat_id=chat_id,
-                                text="✅ Welcome! We've created a new account for you.\n\n"
-                                     "You will now receive promotions and updates from Bank of Abyssinia."
-                            )
-                        )
-                    else:
-                        self.run_async(
-                            self.bot.send_message(
-                                chat_id=chat_id,
-                                text="❌ Failed to create account. Please try again or contact support."
-                            )
-                        )
-            
-            # Check if message is an email
-            elif self.is_email(message_text):
-                logger.info(f"📧 Received email: {message_text} from {chat_id}")
-                
-                contact_record = self.find_contact_by_email(message_text)
-                
-                if contact_record:
-                    success = self.update_contact_chat_id(contact_record['Id'], chat_id, user_data)
-                    if success:
-                        contact_name = contact_record.get('Name', 'Valued Customer')
-                        self.run_async(
-                            self.bot.send_message(
-                                chat_id=chat_id,
-                                text=f"✅ Successfully connected, {contact_name}! You'll receive promotions soon."
-                            )
-                        )
-                    else:
-                        self.run_async(
-                            self.bot.send_message(
-                                chat_id=chat_id,
-                                text="❌ Connection failed. Please try again."
-                            )
-                        )
-                else:
-                    self.run_async(
-                        self.bot.send_message(
-                            chat_id=chat_id,
-                            text="❌ No account found with this email.\n\n"
-                                 "Please share your phone number to create a new account:\n\nExamples: 0912121212, 0712121212, 912121212"
-                        )
-                    )
-                    
-        except Exception as e:
-            logger.error(f"❌ Error handling text message: {e}")
-    
-    def create_new_contact(self, first_name, last_name, phone_number, chat_id, user_data):
-        """Create a new Contact record when no existing match is found"""
-        try:
-            access_token = self.get_salesforce_token()
-            if not access_token:
+            if not self.bot:
+                logger.error("❌ Bot not initialized")
                 return False
             
-            contact_data = {
-                "FirstName": first_name,
-                "LastName": last_name,
-                "MobilePhone": phone_number,
-                "Phone": phone_number,
-                SF_CHAT_ID_FIELD: str(chat_id)
-            }
-            
-            if user_data.get('username'):
-                contact_data["Telegram_Username__c"] = user_data['username']
-            
-            logger.info(f"🆕 Creating new Contact: {first_name} {last_name}, Phone: {phone_number}")
-            
-            success = self.salesforce_create(SF_OBJECT_NAME, contact_data, access_token)
-            
-            if success:
-                logger.info(f"✅ Created new Contact for {first_name} {last_name} with phone {phone_number}")
+            if attachment_url:
+                self.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=attachment_url,
+                    caption=message,
+                    parse_mode='HTML'
+                )
             else:
-                logger.error(f"❌ Failed to create new Contact for {first_name} {last_name}")
+                self.bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                    parse_mode='HTML'
+                )
             
-            return success
+            logger.info(f"✅ Message sent to user {chat_id}")
+            return True
             
         except Exception as e:
-            logger.error(f"❌ Error creating new contact: {e}")
+            logger.error(f"❌ Failed to send to user {chat_id}: {e}")
+            return False
+    
+    def send_to_group(self, group_id, message, attachment_url=None):
+        """Send message to Telegram group"""
+        try:
+            if not self.bot:
+                logger.error("❌ Bot not initialized")
+                return False
+            
+            if attachment_url:
+                self.bot.send_photo(
+                    chat_id=group_id,
+                    photo=attachment_url,
+                    caption=message,
+                    parse_mode='HTML'
+                )
+            else:
+                self.bot.send_message(
+                    chat_id=group_id,
+                    text=message,
+                    parse_mode='HTML'
+                )
+            
+            logger.info(f"✅ Message sent to group {group_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to send to group {group_id}: {e}")
+            return False
+
+class SalesforceManager:
+    def __init__(self):
+        self.access_token = None
+        self.token_expiry = 0
+    
+    def get_salesforce_token(self):
+        """Get Salesforce access token using client_credentials"""
+        try:
+            if self.access_token and time.time() < (self.token_expiry - 300):
+                return self.access_token
+            
+            token_url = f"{SF_INSTANCE_URL}/services/oauth2/token"
+            payload = {
+                'grant_type': 'client_credentials',
+                'client_id': SF_CLIENT_ID,
+                'client_secret': SF_CLIENT_SECRET
+            }
+            
+            headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+            
+            response = requests.post(token_url, data=payload, headers=headers)
+            
+            if response.status_code == 200:
+                token_data = response.json()
+                self.access_token = token_data['access_token']
+                self.token_expiry = time.time() + token_data.get('expires_in', 3600)
+                logger.info("✅ Salesforce access token acquired")
+                return self.access_token
+            else:
+                logger.error(f"❌ Token request failed: {response.status_code} - {response.text}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Token exception: {e}")
+            return None
+    
+    def salesforce_query(self, query, access_token):
+        """Execute SOQL query"""
+        try:
+            headers = {
+                'Authorization': f'Bearer {access_token}',
+                'Content-Type': 'application/json'
+            }
+            
+            url = f"{SF_INSTANCE_URL}/services/data/v58.0/query"
+            params = {'q': query}
+            
+            response = requests.get(url, headers=headers, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                return data['records'][0] if data['totalSize'] > 0 else None
+            else:
+                logger.error(f"Salesforce query error: {response.status_code} - {response.text}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Salesforce query exception: {e}")
+            return None
+    
+    def salesforce_create(self, object_name, create_data, access_token):
+        """Create Salesforce record"""
+        try:
+            headers = {
+                'Authorization': f'Bearer {access_token}',
+                'Content-Type': 'application/json'
+            }
+            
+            url = f"{SF_INSTANCE_URL}/services/data/v58.0/sobjects/{object_name}/"
+            
+            response = requests.post(url, headers=headers, json=create_data)
+            
+            if response.status_code == 201:
+                logger.info(f"✅ Successfully created {object_name} record")
+                return True
+            else:
+                logger.error(f"❌ Failed to create {object_name}: {response.status_code} - {response.text}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Salesforce create exception: {e}")
             return False
     
     def find_contact_by_chat_id(self, chat_id):
@@ -351,148 +284,175 @@ class TelegramMiddleware:
             logger.error(f"❌ Error updating contact chat ID: {e}")
             return False
     
-    def get_salesforce_token(self):
-        """Get Salesforce access token using client_credentials"""
+    def create_new_contact(self, first_name, last_name, phone_number, chat_id, user_data):
+        """Create a new Contact record when no existing match is found"""
         try:
-            if self.access_token and time.time() < (self.token_expiry - 300):
-                return self.access_token
-            
-            token_url = f"{SF_INSTANCE_URL}/services/oauth2/token"
-            payload = {
-                'grant_type': 'client_credentials',
-                'client_id': SF_CLIENT_ID,
-                'client_secret': SF_CLIENT_SECRET
-            }
-            
-            headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-            
-            response = requests.post(token_url, data=payload, headers=headers)
-            
-            if response.status_code == 200:
-                token_data = response.json()
-                self.access_token = token_data['access_token']
-                self.token_expiry = time.time() + token_data.get('expires_in', 3600)
-                logger.info("✅ Salesforce access token acquired")
-                return self.access_token
-            else:
-                logger.error(f"❌ Token request failed: {response.status_code} - {response.text}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"❌ Token exception: {e}")
-            return None
-    
-    def salesforce_query(self, query, access_token):
-        """Execute SOQL query"""
-        try:
-            headers = {
-                'Authorization': f'Bearer {access_token}',
-                'Content-Type': 'application/json'
-            }
-            
-            url = f"{SF_INSTANCE_URL}/services/data/v58.0/query"
-            params = {'q': query}
-            
-            response = requests.get(url, headers=headers, params=params)
-            
-            if response.status_code == 200:
-                data = response.json()
-                return data['records'][0] if data['totalSize'] > 0 else None
-            else:
-                logger.error(f"Salesforce query error: {response.status_code} - {response.text}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Salesforce query exception: {e}")
-            return None
-    
-    def salesforce_create(self, object_name, create_data, access_token):
-        """Create Salesforce record"""
-        try:
-            headers = {
-                'Authorization': f'Bearer {access_token}',
-                'Content-Type': 'application/json'
-            }
-            
-            url = f"{SF_INSTANCE_URL}/services/data/v58.0/sobjects/{object_name}/"
-            
-            response = requests.post(url, headers=headers, json=create_data)
-            
-            if response.status_code == 201:
-                logger.info(f"✅ Successfully created {object_name} record")
-                return True
-            else:
-                logger.error(f"❌ Failed to create {object_name}: {response.status_code} - {response.text}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Salesforce create exception: {e}")
-            return False
-    
-    def send_to_user(self, chat_id, message, attachment_url=None):
-        """Send message to specific Telegram user"""
-        try:
-            if not self.bot:
-                logger.error("❌ Bot not initialized")
+            access_token = self.get_salesforce_token()
+            if not access_token:
                 return False
             
-            if attachment_url:
-                self.run_async(
-                    self.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=attachment_url,
-                        caption=message,
-                        parse_mode='HTML'
-                    )
-                )
-            else:
-                self.run_async(
-                    self.bot.send_message(
-                        chat_id=chat_id,
-                        text=message,
-                        parse_mode='HTML'
-                    )
-                )
+            contact_data = {
+                "FirstName": first_name,
+                "LastName": last_name,
+                "MobilePhone": phone_number,
+                "Phone": phone_number,
+                SF_CHAT_ID_FIELD: str(chat_id)
+            }
             
-            logger.info(f"✅ Message sent to user {chat_id}")
-            return True
+            if user_data.get('username'):
+                contact_data["Telegram_Username__c"] = user_data['username']
+            
+            logger.info(f"🆕 Creating new Contact: {first_name} {last_name}, Phone: {phone_number}")
+            
+            success = self.salesforce_create(SF_OBJECT_NAME, contact_data, access_token)
+            
+            if success:
+                logger.info(f"✅ Created new Contact for {first_name} {last_name} with phone {phone_number}")
+            else:
+                logger.error(f"❌ Failed to create new Contact for {first_name} {last_name}")
+            
+            return success
             
         except Exception as e:
-            logger.error(f"❌ Failed to send to user {chat_id}: {e}")
-            return False
-    
-    def send_to_group(self, group_id, message, attachment_url=None):
-        """Send message to Telegram group"""
-        try:
-            if not self.bot:
-                logger.error("❌ Bot not initialized")
-                return False
-            
-            if attachment_url:
-                self.run_async(
-                    self.bot.send_photo(
-                        chat_id=group_id,
-                        photo=attachment_url,
-                        caption=message,
-                        parse_mode='HTML'
-                    )
-                )
-            else:
-                self.run_async(
-                    self.bot.send_message(
-                        chat_id=group_id,
-                        text=message,
-                        parse_mode='HTML'
-                    )
-                )
-            
-            logger.info(f"✅ Message sent to group {group_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to send to group {group_id}: {e}")
+            logger.error(f"❌ Error creating new contact: {e}")
             return False
 
+class BotManager:
+    def __init__(self):
+        self.bot = TelegramBot()
+        self.sf = SalesforceManager()
+    
+    def handle_start_command(self, chat_id, user_data):
+        """Handle /start command"""
+        try:
+            logger.info(f"👤 Handling start for user: {user_data.get('first_name', 'Unknown')} (ID: {chat_id})")
+            
+            # Check if this Chat ID is already registered
+            existing_contact = self.sf.find_contact_by_chat_id(chat_id)
+            
+            if existing_contact:
+                contact_name = existing_contact.get('Name', 'Valued Customer')
+                self.bot.send_message(
+                    chat_id=chat_id,
+                    message=f"👋 Welcome back, {contact_name}!\n\nYou're already registered for promotions."
+                )
+                return
+            
+            # New user - ask for phone number to find their Contact
+            keyboard = [
+                ["📱 Share Phone Number", "📧 Enter Email Address"],
+                ["❌ I don't have an account"]
+            ]
+            
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+            
+            # For now, send without keyboard to test
+            self.bot.send_message(
+                chat_id=chat_id,
+                message=f"👋 Welcome to Bank of Abyssinia, {user_data.get('first_name', 'there')}!\n\n"
+                       "To connect with your existing account and receive personalized promotions, "
+                       "please share your phone number or email address."
+            )
+            
+        except Exception as e:
+            logger.error(f"❌ Error handling start command: {e}")
+    
+    def handle_text_message(self, chat_id, message_text, user_data):
+        """Handle text messages"""
+        try:
+            if message_text == "❌ I don't have an account":
+                self.bot.send_message(
+                    chat_id=chat_id,
+                    message="Please contact our customer support to create an account first."
+                )
+                return
+            
+            if message_text in ["📱 Share Phone Number", "📧 Enter Email Address"]:
+                if message_text == "📱 Share Phone Number":
+                    self.bot.send_message(
+                        chat_id=chat_id,
+                        message="Please enter your phone number:\n\nExamples: 0912121212, 0712121212, 912121212, +251912121212"
+                    )
+                else:
+                    self.bot.send_message(
+                        chat_id=chat_id,
+                        message="Please enter your email address:"
+                    )
+                return
+            
+            # Check if message is a phone number
+            if self.is_phone_number(message_text):
+                logger.info(f"📞 Received phone: {message_text} from {chat_id}")
+                
+                # Extract last 9 digits for matching
+                last_9_digits = self.extract_last_9_digits(message_text)
+                
+                contact_record = self.sf.find_contact_by_phone(last_9_digits)
+                
+                if contact_record:
+                    success = self.sf.update_contact_chat_id(contact_record['Id'], chat_id, user_data)
+                    if success:
+                        contact_name = contact_record.get('Name', 'Valued Customer')
+                        self.bot.send_message(
+                            chat_id=chat_id,
+                            message=f"✅ Successfully connected, {contact_name}! You'll receive promotions soon."
+                        )
+                    else:
+                        self.bot.send_message(
+                            chat_id=chat_id,
+                            message="❌ Connection failed. Please try again."
+                        )
+                else:
+                    # No Contact found - create new one
+                    success = self.sf.create_new_contact(
+                        first_name=user_data.get('first_name', 'Telegram'),
+                        last_name=user_data.get('last_name', 'User'),
+                        phone_number=message_text,
+                        chat_id=chat_id,
+                        user_data=user_data
+                    )
+                    
+                    if success:
+                        self.bot.send_message(
+                            chat_id=chat_id,
+                            message="✅ Welcome! We've created a new account for you.\n\n"
+                                   "You will now receive promotions and updates from Bank of Abyssinia."
+                        )
+                    else:
+                        self.bot.send_message(
+                            chat_id=chat_id,
+                            message="❌ Failed to create account. Please try again or contact support."
+                        )
+            
+            # Check if message is an email
+            elif self.is_email(message_text):
+                logger.info(f"📧 Received email: {message_text} from {chat_id}")
+                
+                contact_record = self.sf.find_contact_by_email(message_text)
+                
+                if contact_record:
+                    success = self.sf.update_contact_chat_id(contact_record['Id'], chat_id, user_data)
+                    if success:
+                        contact_name = contact_record.get('Name', 'Valued Customer')
+                        self.bot.send_message(
+                            chat_id=chat_id,
+                            message=f"✅ Successfully connected, {contact_name}! You'll receive promotions soon."
+                        )
+                    else:
+                        self.bot.send_message(
+                            chat_id=chat_id,
+                            message="❌ Connection failed. Please try again."
+                        )
+                else:
+                    self.bot.send_message(
+                        chat_id=chat_id,
+                        message="❌ No account found with this email.\n\n"
+                               "Please share your phone number to create a new account:\n\nExamples: 0912121212, 0712121212, 912121212"
+                    )
+                    
+        except Exception as e:
+            logger.error(f"❌ Error handling text message: {e}")
+    
     def is_phone_number(self, text):
         phone_pattern = r'^(\+?251|0)?[97]\d{8}$'
         return re.match(phone_pattern, text.strip()) is not None
@@ -505,8 +465,8 @@ class TelegramMiddleware:
         digits = re.sub(r'[^\d]', '', phone)
         return digits[-9:] if len(digits) >= 9 else digits
 
-# Initialize middleware
-middleware = TelegramMiddleware()
+# Initialize bot manager
+bot_manager = BotManager()
 
 # Flask Routes
 
@@ -522,7 +482,7 @@ def api_send_to_user():
         message = data['message']
         attachment_url = data.get('attachment_url')
         
-        success = middleware.send_to_user(chat_id, message, attachment_url)
+        success = bot_manager.bot.send_message(chat_id, message, attachment_url)
         
         if success:
             return jsonify({
@@ -552,7 +512,7 @@ def api_send_to_group():
         if not group_id:
             return jsonify({'error': 'No group ID configured'}), 400
         
-        success = middleware.send_to_group(group_id, message, attachment_url)
+        success = bot_manager.bot.send_to_group(group_id, message, attachment_url)
         
         if success:
             return jsonify({
@@ -578,7 +538,7 @@ def api_send_to_all_contacts():
         message = data['message']
         attachment_url = data.get('attachment_url')
         
-        access_token = middleware.get_salesforce_token()
+        access_token = bot_manager.sf.get_salesforce_token()
         if not access_token:
             return jsonify({'error': 'Failed to get Salesforce access token'}), 500
         
@@ -607,7 +567,7 @@ def api_send_to_all_contacts():
         for contact in contacts:
             chat_id = contact[SF_CHAT_ID_FIELD]
             if chat_id:
-                success = middleware.send_to_user(chat_id, message, attachment_url)
+                success = bot_manager.bot.send_message(chat_id, message, attachment_url)
                 results.append({
                     'contact_id': contact['Id'],
                     'contact_name': contact.get('Name', 'Unknown'),
@@ -652,7 +612,7 @@ def webhook():
             # Handle commands
             if message_text.startswith('/'):
                 if message_text == '/start':
-                    middleware.handle_start_command(chat_id, user_data)
+                    bot_manager.handle_start_command(chat_id, user_data)
                 elif message_text == '/help':
                     help_text = """
 🤖 **Bank of Abyssinia Telegram Bot**
@@ -665,26 +625,18 @@ def webhook():
 **About:**
 This bot sends you personalized promotions and updates from Bank of Abyssinia through Salesforce integration.
 """
-                    middleware.run_async(
-                        middleware.bot.send_message(
-                            chat_id=chat_id,
-                            text=help_text,
-                            parse_mode='Markdown'
-                        )
+                    bot_manager.bot.send_message(
+                        chat_id=chat_id,
+                        message=help_text
                     )
                 elif message_text == '/register':
-                    keyboard = [["📱 Share Phone Number", "📧 Enter Email Address"]]
-                    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-                    middleware.run_async(
-                        middleware.bot.send_message(
-                            chat_id=chat_id,
-                            text="Please share your phone number or email to connect with your account:",
-                            reply_markup=reply_markup
-                        )
+                    bot_manager.bot.send_message(
+                        chat_id=chat_id,
+                        message="Please share your phone number or email to connect with your account:"
                     )
             else:
                 # Handle regular text messages
-                middleware.handle_text_message(chat_id, message_text, user_data)
+                bot_manager.handle_text_message(chat_id, message_text, user_data)
             
             logger.info("✅ Webhook update processed successfully")
             return jsonify({'status': 'ok'})
@@ -695,57 +647,12 @@ This bot sends you personalized promotions and updates from Bank of Abyssinia th
         logger.error(f"❌ Webhook error: {e}")
         return jsonify({'error': str(e)}), 500
 
-def setup_webhook():
-    """Set up Telegram webhook"""
-    try:
-        if not middleware.bot:
-            logger.error("❌ Bot not initialized for webhook setup")
-            return False
-        
-        # Get your Render app URL
-        webhook_url = "https://telegram-bot-fotq.onrender.com/webhook"
-        
-        logger.info(f"🔗 Setting webhook to: {webhook_url}")
-        
-        # Set webhook using run_async
-        success = middleware.run_async(middleware.bot.set_webhook(webhook_url))
-        
-        if success:
-            logger.info("✅ Webhook set successfully")
-            return True
-        else:
-            logger.error("❌ Failed to set webhook")
-            return False
-            
-    except Exception as e:
-        logger.error(f"❌ Webhook setup error: {e}")
-        return False
-
-@app.route('/set-webhook', methods=['GET'])
-def set_webhook_route():
-    """Manual webhook setup endpoint"""
-    success = setup_webhook()
-    return jsonify({'success': success, 'message': 'Webhook setup attempted'})
-
-@app.route('/delete-webhook', methods=['GET'])
-def delete_webhook():
-    """Delete webhook endpoint"""
-    try:
-        if middleware.bot:
-            success = middleware.run_async(middleware.bot.delete_webhook())
-            return jsonify({'success': success, 'message': 'Webhook deleted'})
-        else:
-            return jsonify({'success': False, 'message': 'Bot not initialized'})
-    except Exception as e:
-        logger.error(f"❌ Delete webhook error: {e}")
-        return jsonify({'success': False, 'message': str(e)})
-
 # Debug endpoints
 @app.route('/debug', methods=['GET'])
 def debug_info():
     """Debug endpoint to check bot status"""
-    bot_status = "Initialized" if middleware.bot else "Not Initialized"
-    sf_token_status = "Available" if middleware.access_token else "Not Available"
+    bot_status = "Initialized" if bot_manager.bot.bot else "Not Initialized"
+    sf_token_status = "Available" if bot_manager.sf.access_token else "Not Available"
     
     return jsonify({
         'bot_status': bot_status,
@@ -770,28 +677,19 @@ def health_check():
 
 @app.route('/')
 def home():
-    bot_status = "✅ Running" if middleware.bot else "❌ Not Running"
+    bot_status = "✅ Running" if bot_manager.bot.bot else "❌ Not Running"
     return jsonify({
         'message': 'Telegram-Salesforce Bot is running!',
         'bot_status': bot_status,
         'endpoints': {
             'debug': 'GET /debug',
             'health': 'GET /health',
-            'set_webhook': 'GET /set-webhook',
-            'delete_webhook': 'GET /delete-webhook',
             'send_to_all_contacts': 'POST /api/send-to-all-contacts',
             'send_to_group': 'POST /api/send-to-group',
             'send_to_user': 'POST /api/send-to-user',
             'webhook': 'POST /webhook'
         }
     })
-
-# Setup webhook when app starts
-with app.app_context():
-    logger.info("🔄 Setting up webhook on application start...")
-    import time
-    time.sleep(3)
-    setup_webhook()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
