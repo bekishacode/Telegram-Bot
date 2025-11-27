@@ -551,6 +551,7 @@ This bot sends you personalized promotions and updates from Bank of Abyssinia th
 middleware = TelegramMiddleware()
 
 # Flask Routes
+
 @app.route('/api/send-to-user', methods=['POST'])
 def api_send_to_user():
     try:
@@ -563,7 +564,19 @@ def api_send_to_user():
         message = data['message']
         attachment_url = data.get('attachment_url')
         
-        success = asyncio.run(middleware.send_to_user(chat_id, message, attachment_url))
+        # Use synchronous execution instead of asyncio
+        import asyncio
+        try:
+            # Try to use existing event loop
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError("Loop is closed")
+        except RuntimeError:
+            # Create new event loop if none exists
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        success = loop.run_until_complete(middleware.send_to_user(chat_id, message, attachment_url))
         
         if success:
             return jsonify({
@@ -593,7 +606,17 @@ def api_send_to_group():
         if not group_id:
             return jsonify({'error': 'No group ID configured'}), 400
         
-        success = asyncio.run(middleware.send_to_group(group_id, message, attachment_url))
+        # Use synchronous execution
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError("Loop is closed")
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        success = loop.run_until_complete(middleware.send_to_group(group_id, message, attachment_url))
         
         if success:
             return jsonify({
@@ -644,11 +667,21 @@ def api_send_to_all_contacts():
         if not contacts:
             return jsonify({'status': 'success', 'message': 'No registered contacts found', 'sent_count': 0})
         
+        # Use synchronous execution for sending
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError("Loop is closed")
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
         results = []
         for contact in contacts:
             chat_id = contact[SF_CHAT_ID_FIELD]
             if chat_id:
-                success = asyncio.run(middleware.send_to_user(chat_id, message, attachment_url))
+                success = loop.run_until_complete(middleware.send_to_user(chat_id, message, attachment_url))
                 results.append({
                     'contact_id': contact['Id'],
                     'contact_name': contact.get('Name', 'Unknown'),
@@ -671,6 +704,26 @@ def api_send_to_all_contacts():
         logger.error(f"❌ Send to all contacts error: {e}")
         return jsonify({'error': str(e)}), 500
 
+# Add the debug endpoint
+@app.route('/debug', methods=['GET'])
+def debug_info():
+    """Debug endpoint to check bot status"""
+    bot_status = "Initialized" if middleware.bot else "Not Initialized"
+    app_status = "Initialized" if middleware.application else "Not Initialized"
+    sf_token_status = "Available" if middleware.access_token else "Not Available"
+    
+    return jsonify({
+        'bot_status': bot_status,
+        'application_status': app_status,
+        'salesforce_token_status': sf_token_status,
+        'environment_variables_set': {
+            'BOT_TOKEN': bool(BOT_TOKEN),
+            'SF_INSTANCE_URL': bool(SF_INSTANCE_URL),
+            'SF_CLIENT_ID': bool(SF_CLIENT_ID),
+            'SF_CLIENT_SECRET': bool(SF_CLIENT_SECRET)
+        }
+    })
+
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
@@ -683,13 +736,16 @@ def health_check():
 
 @app.route('/')
 def home():
+    bot_status = "✅ Running" if middleware.bot else "❌ Not Running"
     return jsonify({
         'message': 'Telegram-Salesforce Bot is running!',
+        'bot_status': bot_status,
         'endpoints': {
-            'send_to_user': 'POST /api/send-to-user',
-            'send_to_group': 'POST /api/send-to-group',
+            'debug': 'GET /debug',
+            'health': 'GET /health',
             'send_to_all_contacts': 'POST /api/send-to-all-contacts',
-            'health': 'GET /health'
+            'send_to_group': 'POST /api/send-to-group',
+            'send_to_user': 'POST /api/send-to-user'
         }
     })
 
