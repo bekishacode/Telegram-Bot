@@ -60,9 +60,18 @@ class TelegramMiddleware:
             # Setup handlers
             self.setup_handlers()
             
-            logger.info("✅ Bot components created successfully")
+            # Initialize the application
+            asyncio.run(self._initialize_application())
+            
+            logger.info("✅ Bot initialized successfully")
         except Exception as e:
             logger.error(f"❌ Failed to initialize bot: {e}")
+    
+    async def _initialize_application(self):
+        """Initialize the application asynchronously"""
+        await self.application.initialize()
+        await self.application.start()
+        logger.info("✅ Application initialized and started")
     
     def setup_handlers(self):
         """Setup Telegram bot handlers"""
@@ -567,8 +576,13 @@ def api_send_to_user():
         message = data['message']
         attachment_url = data.get('attachment_url')
         
-        # Use asyncio.run for simplicity
-        success = asyncio.run(middleware.send_to_user(chat_id, message, attachment_url))
+        # Create new event loop for each request to avoid closed loop issues
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            success = loop.run_until_complete(middleware.send_to_user(chat_id, message, attachment_url))
+        finally:
+            loop.close()
         
         if success:
             return jsonify({
@@ -598,7 +612,13 @@ def api_send_to_group():
         if not group_id:
             return jsonify({'error': 'No group ID configured'}), 400
         
-        success = asyncio.run(middleware.send_to_group(group_id, message, attachment_url))
+        # Create new event loop for each request
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            success = loop.run_until_complete(middleware.send_to_group(group_id, message, attachment_url))
+        finally:
+            loop.close()
         
         if success:
             return jsonify({
@@ -624,7 +644,14 @@ def api_send_to_all_contacts():
         message = data['message']
         attachment_url = data.get('attachment_url')
         
-        access_token = asyncio.run(middleware.get_salesforce_token())
+        # Create new event loop for each request
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            access_token = loop.run_until_complete(middleware.get_salesforce_token())
+        finally:
+            loop.close()
+            
         if not access_token:
             return jsonify({'error': 'Failed to get Salesforce access token'}), 500
         
@@ -653,7 +680,14 @@ def api_send_to_all_contacts():
         for contact in contacts:
             chat_id = contact[SF_CHAT_ID_FIELD]
             if chat_id:
-                success = asyncio.run(middleware.send_to_user(chat_id, message, attachment_url))
+                # Create new event loop for each send
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    success = loop.run_until_complete(middleware.send_to_user(chat_id, message, attachment_url))
+                finally:
+                    loop.close()
+                    
                 results.append({
                     'contact_id': contact['Id'],
                     'contact_name': contact.get('Name', 'Unknown'),
@@ -687,9 +721,15 @@ def webhook():
             
             # Process the update
             if middleware.application:
-                update = Update.de_json(update_data, middleware.application.bot)
-                asyncio.run(middleware.application.process_update(update))
-                logger.info("✅ Webhook update processed successfully")
+                # Create new event loop for webhook processing
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    update = Update.de_json(update_data, middleware.application.bot)
+                    loop.run_until_complete(middleware.application.process_update(update))
+                    logger.info("✅ Webhook update processed successfully")
+                finally:
+                    loop.close()
             else:
                 logger.error("❌ Application not initialized")
             
@@ -713,8 +753,13 @@ def setup_webhook():
         
         logger.info(f"🔗 Setting webhook to: {webhook_url}")
         
-        # Set webhook using asyncio.run
-        success = asyncio.run(middleware.bot.set_webhook(webhook_url))
+        # Create new event loop for webhook setup
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            success = loop.run_until_complete(middleware.bot.set_webhook(webhook_url))
+        finally:
+            loop.close()
         
         if success:
             logger.info("✅ Webhook set successfully")
@@ -738,7 +783,13 @@ def delete_webhook():
     """Delete webhook endpoint"""
     try:
         if middleware.bot:
-            success = asyncio.run(middleware.bot.delete_webhook())
+            # Create new event loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                success = loop.run_until_complete(middleware.bot.delete_webhook())
+            finally:
+                loop.close()
             return jsonify({'success': success, 'message': 'Webhook deleted'})
         else:
             return jsonify({'success': False, 'message': 'Bot not initialized'})
@@ -773,11 +824,17 @@ def bot_status():
         if not middleware.bot:
             return jsonify({'error': 'Bot not initialized'}), 500
             
-        # Get bot info
-        bot_info = asyncio.run(middleware.bot.get_me())
-        
-        # Get webhook info
-        webhook_info = asyncio.run(middleware.bot.get_webhook_info())
+        # Create new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            # Get bot info
+            bot_info = loop.run_until_complete(middleware.bot.get_me())
+            
+            # Get webhook info
+            webhook_info = loop.run_until_complete(middleware.bot.get_webhook_info())
+        finally:
+            loop.close()
         
         status_info = {
             'bot_initialized': bool(middleware.bot),
@@ -829,12 +886,12 @@ def home():
         }
     })
 
-# Setup webhook when app starts (using application context)
+# Setup webhook when app starts
 with app.app_context():
     logger.info("🔄 Setting up webhook on application start...")
     # Give it a moment to ensure everything is loaded
     import time
-    time.sleep(2)
+    time.sleep(3)
     setup_webhook()
 
 if __name__ == '__main__':
