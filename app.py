@@ -60,10 +60,7 @@ class TelegramMiddleware:
             # Setup handlers
             self.setup_handlers()
             
-            # Initialize the application (synchronously)
-            asyncio.run(self.application.initialize())
-            
-            logger.info("✅ Bot initialized successfully")
+            logger.info("✅ Bot components created successfully")
         except Exception as e:
             logger.error(f"❌ Failed to initialize bot: {e}")
     
@@ -832,11 +829,12 @@ def home():
         }
     })
 
-# Setup webhook when app starts
-@app.before_first_request
-def setup_webhook_on_start():
-    """Setup webhook when the application starts"""
+# Setup webhook when app starts (using application context)
+with app.app_context():
     logger.info("🔄 Setting up webhook on application start...")
+    # Give it a moment to ensure everything is loaded
+    import time
+    time.sleep(2)
     setup_webhook()
 
 if __name__ == '__main__':
