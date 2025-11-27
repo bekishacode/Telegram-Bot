@@ -1,9 +1,8 @@
 import os
 import logging
 import re
+import json
 from dotenv import load_dotenv
-import telegram
-from telegram import ReplyKeyboardMarkup
 from flask import Flask, request, jsonify
 import requests
 import time
@@ -40,75 +39,48 @@ logger = logging.getLogger(__name__)
 
 class TelegramBot:
     def __init__(self):
-        self.bot = None
-        self.access_token = None
-        self.token_expiry = 0
-        self.initialize_bot()
-        logger.info("🚀 Telegram-Salesforce Bot Started")
-    
-    def initialize_bot(self):
-        """Initialize bot with error handling"""
-        try:
-            self.bot = telegram.Bot(token=BOT_TOKEN)
-            logger.info("✅ Bot initialized successfully")
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize bot: {e}")
+        self.bot_token = BOT_TOKEN
+        self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
+        logger.info("🚀 Telegram Bot Started")
     
     def send_message(self, chat_id, message, attachment_url=None):
-        """Send message to Telegram user"""
+        """Send message to Telegram user using direct API calls"""
         try:
-            if not self.bot:
-                logger.error("❌ Bot not initialized")
-                return False
-            
             if attachment_url:
-                self.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=attachment_url,
-                    caption=message,
-                    parse_mode='HTML'
-                )
+                # Send photo with caption
+                url = f"{self.base_url}/sendPhoto"
+                data = {
+                    'chat_id': chat_id,
+                    'photo': attachment_url,
+                    'caption': message,
+                    'parse_mode': 'HTML'
+                }
             else:
-                self.bot.send_message(
-                    chat_id=chat_id,
-                    text=message,
-                    parse_mode='HTML'
-                )
+                # Send text message
+                url = f"{self.base_url}/sendMessage"
+                data = {
+                    'chat_id': chat_id,
+                    'text': message,
+                    'parse_mode': 'HTML'
+                }
             
-            logger.info(f"✅ Message sent to user {chat_id}")
-            return True
+            response = requests.post(url, data=data, timeout=30)
+            result = response.json()
             
+            if result.get('ok'):
+                logger.info(f"✅ Message sent to user {chat_id}")
+                return True
+            else:
+                logger.error(f"❌ Failed to send to user {chat_id}: {result.get('description')}")
+                return False
+                
         except Exception as e:
             logger.error(f"❌ Failed to send to user {chat_id}: {e}")
             return False
     
     def send_to_group(self, group_id, message, attachment_url=None):
         """Send message to Telegram group"""
-        try:
-            if not self.bot:
-                logger.error("❌ Bot not initialized")
-                return False
-            
-            if attachment_url:
-                self.bot.send_photo(
-                    chat_id=group_id,
-                    photo=attachment_url,
-                    caption=message,
-                    parse_mode='HTML'
-                )
-            else:
-                self.bot.send_message(
-                    chat_id=group_id,
-                    text=message,
-                    parse_mode='HTML'
-                )
-            
-            logger.info(f"✅ Message sent to group {group_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to send to group {group_id}: {e}")
-            return False
+        return self.send_message(group_id, message, attachment_url)
 
 class SalesforceManager:
     def __init__(self):
@@ -643,7 +615,7 @@ This bot sends you personalized promotions and updates from Bank of Abyssinia th
 @app.route('/debug', methods=['GET'])
 def debug_info():
     """Debug endpoint to check bot status"""
-    bot_status = "Initialized" if bot_manager.bot.bot else "Not Initialized"
+    bot_status = "Initialized" if bot_manager.bot.bot_token else "Not Initialized"
     sf_token_status = "Available" if bot_manager.sf.access_token else "Not Available"
     
     return jsonify({
@@ -669,7 +641,7 @@ def health_check():
 
 @app.route('/')
 def home():
-    bot_status = "✅ Running" if bot_manager.bot.bot else "❌ Not Running"
+    bot_status = "✅ Running" if bot_manager.bot.bot_token else "❌ Not Running"
     return jsonify({
         'message': 'Telegram-Salesforce Bot is running!',
         'bot_status': bot_status,
