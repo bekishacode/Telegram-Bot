@@ -705,6 +705,85 @@ def api_send_to_all_contacts():
         logger.error(f"❌ Send to all contacts error: {e}")
         return jsonify({'error': str(e)}), 500
 
+# Webhook Route
+@app.route('/webhook', methods=['POST'])
+async def webhook():
+    """Handle incoming Telegram updates via webhook"""
+    try:
+        if request.is_json:
+            update_data = request.get_json()
+            update = Update.de_json(update_data, middleware.bot)
+            
+            # Process the update
+            if middleware.application:
+                await middleware.application.process_update(update)
+            
+            return jsonify({'status': 'ok'})
+        else:
+            logger.error("❌ Webhook received non-JSON data")
+            return jsonify({'error': 'Invalid data'}), 400
+    except Exception as e:
+        logger.error(f"❌ Webhook error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+def setup_webhook():
+    """Set up Telegram webhook"""
+    try:
+        if not middleware.bot:
+            logger.error("❌ Bot not initialized for webhook setup")
+            return False
+        
+        # Get your Render app URL (you might need to set this as an environment variable)
+        webhook_url = os.getenv('RENDER_EXTERNAL_URL') or f"https://{os.getenv('RENDER_SERVICE_NAME')}.onrender.com"
+        webhook_url = webhook_url.rstrip('/') + '/webhook'
+        
+        logger.info(f"🔗 Setting webhook to: {webhook_url}")
+        
+        # Set webhook
+        success = asyncio.run(middleware.bot.set_webhook(webhook_url))
+        
+        if success:
+            logger.info("✅ Webhook set successfully")
+            
+            # Get webhook info for verification
+            webhook_info = asyncio.run(middleware.bot.get_webhook_info())
+            logger.info(f"📋 Webhook info: {webhook_info}")
+            
+            return True
+        else:
+            logger.error("❌ Failed to set webhook")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ Webhook setup error: {e}")
+        return False
+
+# Replace your current bot startup with this:
+def start_bot():
+    """Initialize bot with webhook setup"""
+    try:
+        if middleware.application and middleware.bot:
+            logger.info("🤖 Setting up Telegram bot webhook...")
+            
+            # Set up webhook
+            webhook_success = setup_webhook()
+            
+            if webhook_success:
+                logger.info("✅ Bot is ready and listening via webhook")
+            else:
+                logger.error("❌ Failed to set up webhook")
+        else:
+            logger.error("❌ Cannot start bot: application or bot not initialized")
+    except Exception as e:
+        logger.error(f"❌ Bot startup error: {e}")
+
+# Also add a route to manually set/check webhook
+@app.route('/set-webhook', methods=['GET'])
+def set_webhook_route():
+    """Manual webhook setup endpoint"""
+    success = setup_webhook()
+    return jsonify({'success': success, 'message': 'Webhook setup attempted'})
+
 # Add the debug endpoint
 @app.route('/debug', methods=['GET'])
 def debug_info():
@@ -725,6 +804,35 @@ def debug_info():
         }
     })
 
+@app.route('/bot-status', methods=['GET'])
+def bot_status():
+    """Check bot status and recent updates"""
+    try:
+        # Check if bot can get updates
+        updates = asyncio.run(middleware.bot.get_updates(limit=5)) if middleware.bot else []
+        
+        status_info = {
+            'bot_initialized': bool(middleware.bot),
+            'application_initialized': bool(middleware.application),
+            'bot_username': asyncio.run(middleware.bot.get_me()).username if middleware.bot else 'Not available',
+            'recent_updates_count': len(updates),
+            'updates': [
+                {
+                    'update_id': update.update_id,
+                    'message_type': 'message' if update.message else 'callback' if update.callback_query else 'other',
+                    'chat_id': update.message.chat.id if update.message else None,
+                    'text': update.message.text if update.message else None,
+                    'date': update.message.date.isoformat() if update.message else None
+                }
+                for update in updates
+            ] if updates else []
+        }
+        
+        return jsonify(status_info)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
@@ -744,31 +852,27 @@ def home():
         'endpoints': {
             'debug': 'GET /debug',
             'health': 'GET /health',
+            'bot_status': 'GET /bot-status',
+            'set_webhook': 'GET /set-webhook',
             'send_to_all_contacts': 'POST /api/send-to-all-contacts',
             'send_to_group': 'POST /api/send-to-group',
-            'send_to_user': 'POST /api/send-to-user'
+            'send_to_user': 'POST /api/send-to-user',
+            'webhook': 'POST /webhook'
         }
     })
 
-def start_bot():
-    """Start the bot with polling - runs in background"""
-    try:
-        if middleware.application:
-            logger.info("🤖 Starting Telegram bot polling...")
-            middleware.application.run_polling(
-                drop_pending_updates=True,
-                allowed_updates=Update.ALL_TYPES
-            )
-        else:
-            logger.error("❌ Cannot start bot: application not initialized")
-    except Exception as e:
-        logger.error(f"❌ Bot polling error: {e}")
-
 # Start bot in background when app starts
 try:
+    # Add a small delay to ensure Flask is fully initialized
+    import time
+    time.sleep(3)
+    
     bot_thread = threading.Thread(target=start_bot, daemon=True)
     bot_thread.start()
     logger.info("✅ Bot thread started successfully")
+    
+    # Log thread status
+    logger.info(f"📊 Bot thread alive: {bot_thread.is_alive()}")
 except Exception as e:
     logger.error(f"❌ Failed to start bot thread: {e}")
 
