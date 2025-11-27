@@ -42,14 +42,30 @@ logger = logging.getLogger(__name__)
 
 class TelegramMiddleware:
     def __init__(self):
-        self.bot = Bot(token=BOT_TOKEN)
-        self.application = Application.builder().token(BOT_TOKEN).build()
+        # Initialize bot components separately to avoid initialization errors
+        self.bot = None
+        self.application = None
         self.access_token = None
         self.token_expiry = 0
-        self.setup_handlers()
+        self.initialize_bot()
         logger.info("🚀 Telegram-Salesforce Middleware Started")
     
+    def initialize_bot(self):
+        """Initialize bot components with error handling"""
+        try:
+            self.bot = Bot(token=BOT_TOKEN)
+            self.application = Application.builder().token(BOT_TOKEN).build()
+            self.setup_handlers()
+            logger.info("✅ Bot initialized successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize bot: {e}")
+            # Don't raise the exception, allow the web server to start
+    
     def setup_handlers(self):
+        """Setup Telegram bot handlers"""
+        if not self.application:
+            return
+            
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("register", self.register_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
@@ -466,6 +482,10 @@ This bot sends you personalized promotions and updates from Bank of Abyssinia th
     async def send_to_user(self, chat_id, message, attachment_url=None):
         """Send message to specific Telegram user"""
         try:
+            if not self.bot:
+                logger.error("❌ Bot not initialized")
+                return False
+                
             if attachment_url:
                 await self.bot.send_photo(
                     chat_id=chat_id,
@@ -490,6 +510,10 @@ This bot sends you personalized promotions and updates from Bank of Abyssinia th
     async def send_to_group(self, group_id, message, attachment_url=None):
         """Send message to Telegram group"""
         try:
+            if not self.bot:
+                logger.error("❌ Bot not initialized")
+                return False
+                
             if attachment_url:
                 await self.bot.send_photo(
                     chat_id=group_id,
@@ -670,22 +694,29 @@ def home():
     })
 
 def start_bot():
-    """Start the bot with polling"""
+    """Start the bot with polling - runs in background"""
     try:
-        logger.info("🤖 Starting Telegram bot polling...")
-        middleware.application.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES
-        )
+        if middleware.application:
+            logger.info("🤖 Starting Telegram bot polling...")
+            middleware.application.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES
+            )
+        else:
+            logger.error("❌ Cannot start bot: application not initialized")
     except Exception as e:
         logger.error(f"❌ Bot polling error: {e}")
 
 # Start bot in background when app starts
-import threading
-bot_thread = threading.Thread(target=start_bot, daemon=True)
-bot_thread.start()
+try:
+    bot_thread = threading.Thread(target=start_bot, daemon=True)
+    bot_thread.start()
+    logger.info("✅ Bot thread started successfully")
+except Exception as e:
+    logger.error(f"❌ Failed to start bot thread: {e}")
 
 if __name__ == '__main__':
     # This is for local development
     # On Render, gunicorn will run the app
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
