@@ -57,6 +57,12 @@ class TelegramMiddleware:
             self.bot = Bot(token=BOT_TOKEN)
             self.application = Application.builder().token(BOT_TOKEN).build()
             self.setup_handlers()
+            
+            # Initialize the application
+            awaitable = self.application.initialize()
+            if asyncio.iscoroutine(awaitable):
+                asyncio.run(awaitable)
+                
             logger.info("✅ Bot initialized successfully")
         except Exception as e:
             logger.error(f"❌ Failed to initialize bot: {e}")
@@ -565,19 +571,8 @@ def api_send_to_user():
         message = data['message']
         attachment_url = data.get('attachment_url')
         
-        # Use synchronous execution instead of asyncio
-        import asyncio
-        try:
-            # Try to use existing event loop
-            loop = asyncio.get_event_loop()
-            if loop.is_closed():
-                raise RuntimeError("Loop is closed")
-        except RuntimeError:
-            # Create new event loop if none exists
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        success = loop.run_until_complete(middleware.send_to_user(chat_id, message, attachment_url))
+        # Use asyncio.run for simplicity
+        success = asyncio.run(middleware.send_to_user(chat_id, message, attachment_url))
         
         if success:
             return jsonify({
@@ -607,17 +602,7 @@ def api_send_to_group():
         if not group_id:
             return jsonify({'error': 'No group ID configured'}), 400
         
-        # Use synchronous execution
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_closed():
-                raise RuntimeError("Loop is closed")
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        success = loop.run_until_complete(middleware.send_to_group(group_id, message, attachment_url))
+        success = asyncio.run(middleware.send_to_group(group_id, message, attachment_url))
         
         if success:
             return jsonify({
@@ -668,21 +653,11 @@ def api_send_to_all_contacts():
         if not contacts:
             return jsonify({'status': 'success', 'message': 'No registered contacts found', 'sent_count': 0})
         
-        # Use synchronous execution for sending
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_closed():
-                raise RuntimeError("Loop is closed")
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
         results = []
         for contact in contacts:
             chat_id = contact[SF_CHAT_ID_FIELD]
             if chat_id:
-                success = loop.run_until_complete(middleware.send_to_user(chat_id, message, attachment_url))
+                success = asyncio.run(middleware.send_to_user(chat_id, message, attachment_url))
                 results.append({
                     'contact_id': contact['Id'],
                     'contact_name': contact.get('Name', 'Unknown'),
@@ -705,18 +680,19 @@ def api_send_to_all_contacts():
         logger.error(f"❌ Send to all contacts error: {e}")
         return jsonify({'error': str(e)}), 500
 
-# Webhook Route
+# Webhook Route - Use sync approach
 @app.route('/webhook', methods=['POST'])
-async def webhook():
+def webhook():
     """Handle incoming Telegram updates via webhook"""
     try:
         if request.is_json:
             update_data = request.get_json()
             update = Update.de_json(update_data, middleware.bot)
             
-            # Process the update
+            # Process the update synchronously
             if middleware.application:
-                await middleware.application.process_update(update)
+                # Use asyncio.run to process the update
+                asyncio.run(middleware.application.process_update(update))
             
             return jsonify({'status': 'ok'})
         else:
@@ -733,22 +709,16 @@ def setup_webhook():
             logger.error("❌ Bot not initialized for webhook setup")
             return False
         
-        # Get your Render app URL (you might need to set this as an environment variable)
-        webhook_url = os.getenv('RENDER_EXTERNAL_URL') or f"https://{os.getenv('RENDER_SERVICE_NAME')}.onrender.com"
-        webhook_url = webhook_url.rstrip('/') + '/webhook'
+        # Get your Render app URL
+        webhook_url = "https://telegram-bot-fotq.onrender.com/webhook"
         
         logger.info(f"🔗 Setting webhook to: {webhook_url}")
         
-        # Set webhook
+        # Set webhook using asyncio.run
         success = asyncio.run(middleware.bot.set_webhook(webhook_url))
         
         if success:
             logger.info("✅ Webhook set successfully")
-            
-            # Get webhook info for verification
-            webhook_info = asyncio.run(middleware.bot.get_webhook_info())
-            logger.info(f"📋 Webhook info: {webhook_info}")
-            
             return True
         else:
             logger.error("❌ Failed to set webhook")
@@ -758,31 +728,24 @@ def setup_webhook():
         logger.error(f"❌ Webhook setup error: {e}")
         return False
 
-# Replace your current bot startup with this:
-def start_bot():
-    """Initialize bot with webhook setup"""
-    try:
-        if middleware.application and middleware.bot:
-            logger.info("🤖 Setting up Telegram bot webhook...")
-            
-            # Set up webhook
-            webhook_success = setup_webhook()
-            
-            if webhook_success:
-                logger.info("✅ Bot is ready and listening via webhook")
-            else:
-                logger.error("❌ Failed to set up webhook")
-        else:
-            logger.error("❌ Cannot start bot: application or bot not initialized")
-    except Exception as e:
-        logger.error(f"❌ Bot startup error: {e}")
-
-# Also add a route to manually set/check webhook
 @app.route('/set-webhook', methods=['GET'])
 def set_webhook_route():
     """Manual webhook setup endpoint"""
     success = setup_webhook()
     return jsonify({'success': success, 'message': 'Webhook setup attempted'})
+
+@app.route('/delete-webhook', methods=['GET'])
+def delete_webhook():
+    """Delete webhook endpoint"""
+    try:
+        if middleware.bot:
+            success = asyncio.run(middleware.bot.delete_webhook())
+            return jsonify({'success': success, 'message': 'Webhook deleted'})
+        else:
+            return jsonify({'success': False, 'message': 'Bot not initialized'})
+    except Exception as e:
+        logger.error(f"❌ Delete webhook error: {e}")
+        return jsonify({'success': False, 'message': str(e)})
 
 # Add the debug endpoint
 @app.route('/debug', methods=['GET'])
@@ -806,26 +769,31 @@ def debug_info():
 
 @app.route('/bot-status', methods=['GET'])
 def bot_status():
-    """Check bot status and recent updates"""
+    """Check bot status"""
     try:
-        # Check if bot can get updates
-        updates = asyncio.run(middleware.bot.get_updates(limit=5)) if middleware.bot else []
+        if not middleware.bot:
+            return jsonify({'error': 'Bot not initialized'}), 500
+            
+        # Get bot info
+        bot_info = asyncio.run(middleware.bot.get_me())
+        
+        # Get webhook info
+        webhook_info = asyncio.run(middleware.bot.get_webhook_info())
         
         status_info = {
             'bot_initialized': bool(middleware.bot),
             'application_initialized': bool(middleware.application),
-            'bot_username': asyncio.run(middleware.bot.get_me()).username if middleware.bot else 'Not available',
-            'recent_updates_count': len(updates),
-            'updates': [
-                {
-                    'update_id': update.update_id,
-                    'message_type': 'message' if update.message else 'callback' if update.callback_query else 'other',
-                    'chat_id': update.message.chat.id if update.message else None,
-                    'text': update.message.text if update.message else None,
-                    'date': update.message.date.isoformat() if update.message else None
-                }
-                for update in updates
-            ] if updates else []
+            'bot_username': bot_info.username,
+            'bot_first_name': bot_info.first_name,
+            'webhook_info': {
+                'url': webhook_info.url,
+                'has_custom_certificate': webhook_info.has_custom_certificate,
+                'pending_update_count': webhook_info.pending_update_count,
+                'last_error_date': webhook_info.last_error_date,
+                'last_error_message': webhook_info.last_error_message,
+                'max_connections': webhook_info.max_connections,
+                'allowed_updates': webhook_info.allowed_updates
+            }
         }
         
         return jsonify(status_info)
@@ -854,6 +822,7 @@ def home():
             'health': 'GET /health',
             'bot_status': 'GET /bot-status',
             'set_webhook': 'GET /set-webhook',
+            'delete_webhook': 'GET /delete-webhook',
             'send_to_all_contacts': 'POST /api/send-to-all-contacts',
             'send_to_group': 'POST /api/send-to-group',
             'send_to_user': 'POST /api/send-to-user',
@@ -861,23 +830,22 @@ def home():
         }
     })
 
-# Start bot in background when app starts
-try:
-    # Add a small delay to ensure Flask is fully initialized
+# Setup webhook when app starts
+def setup_webhook_on_start():
+    """Setup webhook when the application starts"""
     import time
-    time.sleep(3)
-    
-    bot_thread = threading.Thread(target=start_bot, daemon=True)
-    bot_thread.start()
-    logger.info("✅ Bot thread started successfully")
-    
-    # Log thread status
-    logger.info(f"📊 Bot thread alive: {bot_thread.is_alive()}")
+    time.sleep(5)  # Wait for Flask to be ready
+    logger.info("🔄 Setting up webhook on application start...")
+    setup_webhook()
+
+# Start webhook setup in background
+try:
+    webhook_thread = threading.Thread(target=setup_webhook_on_start, daemon=True)
+    webhook_thread.start()
+    logger.info("✅ Webhook setup thread started")
 except Exception as e:
-    logger.error(f"❌ Failed to start bot thread: {e}")
+    logger.error(f"❌ Failed to start webhook setup thread: {e}")
 
 if __name__ == '__main__':
-    # This is for local development
-    # On Render, gunicorn will run the app
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
