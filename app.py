@@ -1,4 +1,3 @@
-import threading
 import os
 import logging
 import asyncio
@@ -43,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 class TelegramMiddleware:
     def __init__(self):
-        # Initialize bot components separately to avoid initialization errors
+        # Initialize bot components
         self.bot = None
         self.application = None
         self.access_token = None
@@ -54,19 +53,19 @@ class TelegramMiddleware:
     def initialize_bot(self):
         """Initialize bot components with error handling"""
         try:
+            # Create bot and application
             self.bot = Bot(token=BOT_TOKEN)
             self.application = Application.builder().token(BOT_TOKEN).build()
+            
+            # Setup handlers
             self.setup_handlers()
             
-            # Initialize the application
-            awaitable = self.application.initialize()
-            if asyncio.iscoroutine(awaitable):
-                asyncio.run(awaitable)
-                
+            # Initialize the application (synchronously)
+            asyncio.run(self.application.initialize())
+            
             logger.info("✅ Bot initialized successfully")
         except Exception as e:
             logger.error(f"❌ Failed to initialize bot: {e}")
-            # Don't raise the exception, allow the web server to start
     
     def setup_handlers(self):
         """Setup Telegram bot handlers"""
@@ -680,19 +679,22 @@ def api_send_to_all_contacts():
         logger.error(f"❌ Send to all contacts error: {e}")
         return jsonify({'error': str(e)}), 500
 
-# Webhook Route - Use sync approach
+# Webhook Route
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """Handle incoming Telegram updates via webhook"""
     try:
         if request.is_json:
             update_data = request.get_json()
-            update = Update.de_json(update_data, middleware.bot)
+            logger.info(f"📥 Received webhook update: {update_data}")
             
-            # Process the update synchronously
+            # Process the update
             if middleware.application:
-                # Use asyncio.run to process the update
+                update = Update.de_json(update_data, middleware.application.bot)
                 asyncio.run(middleware.application.process_update(update))
+                logger.info("✅ Webhook update processed successfully")
+            else:
+                logger.error("❌ Application not initialized")
             
             return jsonify({'status': 'ok'})
         else:
@@ -831,20 +833,11 @@ def home():
     })
 
 # Setup webhook when app starts
+@app.before_first_request
 def setup_webhook_on_start():
     """Setup webhook when the application starts"""
-    import time
-    time.sleep(5)  # Wait for Flask to be ready
     logger.info("🔄 Setting up webhook on application start...")
     setup_webhook()
-
-# Start webhook setup in background
-try:
-    webhook_thread = threading.Thread(target=setup_webhook_on_start, daemon=True)
-    webhook_thread.start()
-    logger.info("✅ Webhook setup thread started")
-except Exception as e:
-    logger.error(f"❌ Failed to start webhook setup thread: {e}")
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
