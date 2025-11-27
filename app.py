@@ -339,14 +339,6 @@ class BotManager:
                 return
             
             # New user - ask for phone number to find their Contact
-            keyboard = [
-                ["📱 Share Phone Number", "📧 Enter Email Address"],
-                ["❌ I don't have an account"]
-            ]
-            
-            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-            
-            # For now, send without keyboard to test
             self.bot.send_message(
                 chat_id=chat_id,
                 message=f"👋 Welcome to Bank of Abyssinia, {user_data.get('first_name', 'there')}!\n\n"
