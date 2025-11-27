@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: telegram-salesforce-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn Telegram_bot:app
+    envVars:
+      - key: BOT_TOKEN
+        fromGroup: telegram-bot-secrets
+      - key: SF_INSTANCE_URL
+        fromGroup: telegram-bot-secrets
+      - key: SF_CLIENT_ID
+        fromGroup: telegram-bot-secrets
+      - key: SF_CLIENT_SECRET
+        fromGroup: telegram-bot-secrets
+      - key: MAIN_GROUP_ID
+        fromGroup: telegram-bot-secrets
+      - key: ANNOUNCEMENTS_GROUP_ID
+        fromGroup: telegram-bot-secrets
