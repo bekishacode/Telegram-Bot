@@ -1,13 +1,14 @@
 import os
 import logging
+import asyncio
 import re
 from dotenv import load_dotenv
 from telegram import Bot, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from flask import Flask, request, jsonify
 import requests
 import json
 import time
+import threading
 
 load_dotenv()
 
@@ -45,20 +46,34 @@ class TelegramMiddleware:
         self.bot = None
         self.access_token = None
         self.token_expiry = 0
+        self.loop = None
         self.initialize_bot()
         logger.info("🚀 Telegram-Salesforce Middleware Started")
     
     def initialize_bot(self):
         """Initialize bot components with error handling"""
         try:
-            # Create bot only - we'll handle updates via webhook manually
+            # Create bot
             self.bot = Bot(token=BOT_TOKEN)
+            
+            # Create and set event loop
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            
             logger.info("✅ Bot initialized successfully")
         except Exception as e:
             logger.error(f"❌ Failed to initialize bot: {e}")
     
+    def run_async(self, coroutine):
+        """Run async coroutine in the event loop"""
+        try:
+            return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result(timeout=30)
+        except Exception as e:
+            logger.error(f"❌ Async operation failed: {e}")
+            return None
+    
     def handle_start_command(self, chat_id, user_data):
-        """Handle /start command synchronously"""
+        """Handle /start command"""
         try:
             logger.info(f"👤 Handling start for user: {user_data.get('first_name', 'Unknown')} (ID: {chat_id})")
             
@@ -67,9 +82,11 @@ class TelegramMiddleware:
             
             if existing_contact:
                 contact_name = existing_contact.get('Name', 'Valued Customer')
-                self.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"👋 Welcome back, {contact_name}!\n\nYou're already registered for promotions."
+                self.run_async(
+                    self.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"👋 Welcome back, {contact_name}!\n\nYou're already registered for promotions."
+                    )
                 )
                 return
             
@@ -81,37 +98,45 @@ class TelegramMiddleware:
             
             reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
             
-            self.bot.send_message(
-                chat_id=chat_id,
-                text=f"👋 Welcome to Bank of Abyssinia, {user_data.get('first_name', 'there')}!\n\n"
-                     "To connect with your existing account and receive personalized promotions, "
-                     "please share your phone number or email address.",
-                reply_markup=reply_markup
+            self.run_async(
+                self.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"👋 Welcome to Bank of Abyssinia, {user_data.get('first_name', 'there')}!\n\n"
+                         "To connect with your existing account and receive personalized promotions, "
+                         "please share your phone number or email address.",
+                    reply_markup=reply_markup
+                )
             )
             
         except Exception as e:
             logger.error(f"❌ Error handling start command: {e}")
     
     def handle_text_message(self, chat_id, message_text, user_data):
-        """Handle text messages synchronously"""
+        """Handle text messages"""
         try:
             if message_text == "❌ I don't have an account":
-                self.bot.send_message(
-                    chat_id=chat_id,
-                    text="Please contact our customer support to create an account first."
+                self.run_async(
+                    self.bot.send_message(
+                        chat_id=chat_id,
+                        text="Please contact our customer support to create an account first."
+                    )
                 )
                 return
             
             if message_text in ["📱 Share Phone Number", "📧 Enter Email Address"]:
                 if message_text == "📱 Share Phone Number":
-                    self.bot.send_message(
-                        chat_id=chat_id,
-                        text="Please enter your phone number:\n\nExamples: 0912121212, 0712121212, 912121212, +251912121212"
+                    self.run_async(
+                        self.bot.send_message(
+                            chat_id=chat_id,
+                            text="Please enter your phone number:\n\nExamples: 0912121212, 0712121212, 912121212, +251912121212"
+                        )
                     )
                 else:
-                    self.bot.send_message(
-                        chat_id=chat_id,
-                        text="Please enter your email address:"
+                    self.run_async(
+                        self.bot.send_message(
+                            chat_id=chat_id,
+                            text="Please enter your email address:"
+                        )
                     )
                 return
             
@@ -128,14 +153,18 @@ class TelegramMiddleware:
                     success = self.update_contact_chat_id(contact_record['Id'], chat_id, user_data)
                     if success:
                         contact_name = contact_record.get('Name', 'Valued Customer')
-                        self.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"✅ Successfully connected, {contact_name}! You'll receive promotions soon."
+                        self.run_async(
+                            self.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"✅ Successfully connected, {contact_name}! You'll receive promotions soon."
+                            )
                         )
                     else:
-                        self.bot.send_message(
-                            chat_id=chat_id,
-                            text="❌ Connection failed. Please try again."
+                        self.run_async(
+                            self.bot.send_message(
+                                chat_id=chat_id,
+                                text="❌ Connection failed. Please try again."
+                            )
                         )
                 else:
                     # No Contact found - create new one
@@ -148,15 +177,19 @@ class TelegramMiddleware:
                     )
                     
                     if success:
-                        self.bot.send_message(
-                            chat_id=chat_id,
-                            text="✅ Welcome! We've created a new account for you.\n\n"
-                                 "You will now receive promotions and updates from Bank of Abyssinia."
+                        self.run_async(
+                            self.bot.send_message(
+                                chat_id=chat_id,
+                                text="✅ Welcome! We've created a new account for you.\n\n"
+                                     "You will now receive promotions and updates from Bank of Abyssinia."
+                            )
                         )
                     else:
-                        self.bot.send_message(
-                            chat_id=chat_id,
-                            text="❌ Failed to create account. Please try again or contact support."
+                        self.run_async(
+                            self.bot.send_message(
+                                chat_id=chat_id,
+                                text="❌ Failed to create account. Please try again or contact support."
+                            )
                         )
             
             # Check if message is an email
@@ -169,20 +202,26 @@ class TelegramMiddleware:
                     success = self.update_contact_chat_id(contact_record['Id'], chat_id, user_data)
                     if success:
                         contact_name = contact_record.get('Name', 'Valued Customer')
-                        self.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"✅ Successfully connected, {contact_name}! You'll receive promotions soon."
+                        self.run_async(
+                            self.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"✅ Successfully connected, {contact_name}! You'll receive promotions soon."
+                            )
                         )
                     else:
-                        self.bot.send_message(
-                            chat_id=chat_id,
-                            text="❌ Connection failed. Please try again."
+                        self.run_async(
+                            self.bot.send_message(
+                                chat_id=chat_id,
+                                text="❌ Connection failed. Please try again."
+                            )
                         )
                 else:
-                    self.bot.send_message(
-                        chat_id=chat_id,
-                        text="❌ No account found with this email.\n\n"
-                             "Please share your phone number to create a new account:\n\nExamples: 0912121212, 0712121212, 912121212"
+                    self.run_async(
+                        self.bot.send_message(
+                            chat_id=chat_id,
+                            text="❌ No account found with this email.\n\n"
+                                 "Please share your phone number to create a new account:\n\nExamples: 0912121212, 0712121212, 912121212"
+                        )
                     )
                     
         except Exception as e:
@@ -396,19 +435,23 @@ class TelegramMiddleware:
             if not self.bot:
                 logger.error("❌ Bot not initialized")
                 return False
-                
+            
             if attachment_url:
-                self.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=attachment_url,
-                    caption=message,
-                    parse_mode='HTML'
+                self.run_async(
+                    self.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=attachment_url,
+                        caption=message,
+                        parse_mode='HTML'
+                    )
                 )
             else:
-                self.bot.send_message(
-                    chat_id=chat_id,
-                    text=message,
-                    parse_mode='HTML'
+                self.run_async(
+                    self.bot.send_message(
+                        chat_id=chat_id,
+                        text=message,
+                        parse_mode='HTML'
+                    )
                 )
             
             logger.info(f"✅ Message sent to user {chat_id}")
@@ -424,19 +467,23 @@ class TelegramMiddleware:
             if not self.bot:
                 logger.error("❌ Bot not initialized")
                 return False
-                
+            
             if attachment_url:
-                self.bot.send_photo(
-                    chat_id=group_id,
-                    photo=attachment_url,
-                    caption=message,
-                    parse_mode='HTML'
+                self.run_async(
+                    self.bot.send_photo(
+                        chat_id=group_id,
+                        photo=attachment_url,
+                        caption=message,
+                        parse_mode='HTML'
+                    )
                 )
             else:
-                self.bot.send_message(
-                    chat_id=group_id,
-                    text=message,
-                    parse_mode='HTML'
+                self.run_async(
+                    self.bot.send_message(
+                        chat_id=group_id,
+                        text=message,
+                        parse_mode='HTML'
+                    )
                 )
             
             logger.info(f"✅ Message sent to group {group_id}")
@@ -618,18 +665,22 @@ def webhook():
 **About:**
 This bot sends you personalized promotions and updates from Bank of Abyssinia through Salesforce integration.
 """
-                    middleware.bot.send_message(
-                        chat_id=chat_id,
-                        text=help_text,
-                        parse_mode='Markdown'
+                    middleware.run_async(
+                        middleware.bot.send_message(
+                            chat_id=chat_id,
+                            text=help_text,
+                            parse_mode='Markdown'
+                        )
                     )
                 elif message_text == '/register':
                     keyboard = [["📱 Share Phone Number", "📧 Enter Email Address"]]
                     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-                    middleware.bot.send_message(
-                        chat_id=chat_id,
-                        text="Please share your phone number or email to connect with your account:",
-                        reply_markup=reply_markup
+                    middleware.run_async(
+                        middleware.bot.send_message(
+                            chat_id=chat_id,
+                            text="Please share your phone number or email to connect with your account:",
+                            reply_markup=reply_markup
+                        )
                     )
             else:
                 # Handle regular text messages
@@ -656,8 +707,8 @@ def setup_webhook():
         
         logger.info(f"🔗 Setting webhook to: {webhook_url}")
         
-        # Set webhook synchronously
-        success = middleware.bot.set_webhook(webhook_url)
+        # Set webhook using run_async
+        success = middleware.run_async(middleware.bot.set_webhook(webhook_url))
         
         if success:
             logger.info("✅ Webhook set successfully")
@@ -681,7 +732,7 @@ def delete_webhook():
     """Delete webhook endpoint"""
     try:
         if middleware.bot:
-            success = middleware.bot.delete_webhook()
+            success = middleware.run_async(middleware.bot.delete_webhook())
             return jsonify({'success': success, 'message': 'Webhook deleted'})
         else:
             return jsonify({'success': False, 'message': 'Bot not initialized'})
