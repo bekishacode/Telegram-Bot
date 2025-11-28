@@ -696,25 +696,26 @@ def webhook():
     try:
         if request.is_json:
             update_data = request.get_json()
-            logger.info(f"📥 Received webhook update")
+            logger.info(f"📥 Received webhook update: {update_data}")
             
-            # Extract message data
-            message = update_data.get('message', {})
-            chat_id = message.get('chat', {}).get('id')
-            message_text = message.get('text', '')
-            user_data = message.get('from', {})
-            telegram_message_id = message.get('message_id')
-            
-            if not chat_id:
-                logger.error("❌ No chat ID in webhook update")
-                return jsonify({'status': 'error', 'message': 'No chat ID'}), 400
-            
-            # Handle commands
-            if message_text.startswith('/'):
-                if message_text == '/start':
-                    bot_manager.handle_start_command(chat_id, user_data)
-                elif message_text == '/help':
-                    help_text = """
+            # Handle different types of updates
+            if 'message' in update_data:
+                message = update_data.get('message', {})
+                chat_id = message.get('chat', {}).get('id')
+                message_text = message.get('text', '')
+                user_data = message.get('from', {})
+                telegram_message_id = message.get('message_id')
+                
+                if not chat_id:
+                    logger.error("❌ No chat ID in message")
+                    return jsonify({'status': 'error', 'message': 'No chat ID'}), 400
+                
+                # Handle commands
+                if message_text and message_text.startswith('/'):
+                    if message_text == '/start':
+                        bot_manager.handle_start_command(chat_id, user_data)
+                    elif message_text == '/help':
+                        help_text = """
 🤖 **Bank of Abyssinia Telegram Bot**
 
 **Available Commands:**
@@ -724,27 +725,25 @@ def webhook():
 
 **Chat with Support:**
 Just send a message and our team will help you!
-
-**About:**
-This bot sends you personalized promotions and updates from Bank of Abyssinia through Salesforce integration.
 """
-                    bot_manager.bot.send_message(
-                        chat_id=chat_id,
-                        message=help_text
-                    )
-                elif message_text == '/register':
-                    bot_manager.bot.send_message(
-                        chat_id=chat_id,
-                        message="Please share your phone number or email to connect with your account:"
-                    )
-                elif message_text == '/support':
-                    bot_manager.bot.send_message(
-                        chat_id=chat_id,
-                        message="💬 You can now chat with our support team directly! Just type your message and we'll get back to you."
-                    )
+                        bot_manager.bot.send_message(chat_id, message=help_text)
+                    elif message_text == '/register':
+                        bot_manager.bot.send_message(chat_id, message="Please share your phone number or email to connect with your account:")
+                elif message_text:
+                    # Handle regular text messages
+                    bot_manager.handle_text_message(chat_id, message_text, user_data, telegram_message_id)
+            
+            elif 'edited_message' in update_data:
+                # Handle edited messages if needed
+                logger.info("📝 Received edited message")
+                
+            elif 'channel_post' in update_data:
+                # Handle channel posts if needed
+                logger.info("📢 Received channel post")
+                
             else:
-                # Handle regular text messages (both registration and conversation)
-                bot_manager.handle_text_message(chat_id, message_text, user_data, telegram_message_id)
+                logger.warning(f"⚠️ Unhandled update type: {update_data.keys()}")
+                return jsonify({'status': 'ignored', 'message': 'Unhandled update type'}), 200
             
             logger.info("✅ Webhook update processed successfully")
             return jsonify({'status': 'ok'})
