@@ -229,13 +229,6 @@ class SalesforceManager:
                 SF_CHAT_ID_FIELD: str(chat_id)
             }
             
-            if user_data.get('username'):
-                update_data["Telegram_Username__c"] = user_data['username']
-            if user_data.get('first_name'):
-                update_data["Telegram_First_Name__c"] = user_data['first_name']
-            if user_data.get('last_name'):
-                update_data["Telegram_Last_Name__c"] = user_data['last_name']
-            
             headers = {
                 'Authorization': f'Bearer {access_token}',
                 'Content-Type': 'application/json'
@@ -270,9 +263,6 @@ class SalesforceManager:
                 "Phone": phone_number,
                 SF_CHAT_ID_FIELD: str(chat_id)
             }
-            
-            if user_data.get('username'):
-                contact_data["Telegram_Username__c"] = user_data['username']
             
             logger.info(f"🆕 Creating new Contact: {first_name} {last_name}, Phone: {phone_number}")
             
