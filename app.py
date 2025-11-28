@@ -304,43 +304,73 @@ class SalesforceManager:
             return False
     
     def store_incoming_message(self, chat_id, message_text, telegram_message_id, user_data):
-        """Store incoming Telegram message in Salesforce"""
-        try:
-            access_token = self.get_salesforce_token()
-            if not access_token:
-                return False
-            
-            # Find contact by chat ID
-            contact = self.find_contact_by_chat_id(chat_id)
-            if not contact:
-                logger.error(f"❌ No contact found for chat ID: {chat_id}")
-                return False
-            
-            # Create a Task to represent the incoming message
-            task_data = {
-                "Subject": "Incoming Telegram Message",
-                "Status": "Completed",
-                "Priority": "Normal",
-                "WhoId": contact['Id'],  # Link to Contact
-                "Description": f"From: {user_data.get('first_name', 'Unknown')} {user_data.get('last_name', '')}\n"
-                              f"Username: @{user_data.get('username', 'N/A')}\n"
-                              f"Message: {message_text}\n"
-                              f"Telegram Message ID: {telegram_message_id}",
-                "ActivityDate": time.strftime('%Y-%m-%d')
-            }
-            
-            success = self.salesforce_create("Task", task_data, access_token)
-            
-            if success:
-                logger.info(f"✅ Stored incoming message from {chat_id} in Salesforce")
-            else:
-                logger.error(f"❌ Failed to store incoming message from {chat_id}")
-            
-            return success
-            
-        except Exception as e:
-            logger.error(f"❌ Error storing incoming message: {e}")
+    """Store incoming Telegram message in Salesforce"""
+    try:
+        access_token = self.get_salesforce_token()
+        if not access_token:
             return False
+        
+        # Find contact OR lead by chat ID
+        contact = self.find_contact_by_chat_id(chat_id)
+        lead = self.find_lead_by_chat_id(chat_id)
+        
+        record_id = None
+        object_name = None
+        
+        if contact:
+            record_id = contact['Id']
+            object_name = "Contact"
+        elif lead:
+            record_id = lead['Id'] 
+            object_name = "Lead"
+        else:
+            logger.error(f"❌ No contact or lead found for chat ID: {chat_id}")
+            return False
+        
+        # Create a Task to represent the incoming message
+        task_data = {
+            "Subject": "Incoming Telegram Message",
+            "Status": "Completed",
+            "Priority": "Normal",
+            "Description": f"From: {user_data.get('first_name', 'Unknown')} {user_data.get('last_name', '')}\n"
+                          f"Username: @{user_data.get('username', 'N/A')}\n"
+                          f"Message: {message_text}\n"
+                          f"Telegram Message ID: {telegram_message_id}",
+            "ActivityDate": time.strftime('%Y-%m-%d')
+        }
+        
+        # Link to correct object
+        if object_name == "Contact":
+            task_data["WhoId"] = record_id
+        else:  # Lead
+            task_data["WhatId"] = record_id
+        
+        success = self.salesforce_create("Task", task_data, access_token)
+        
+        if success:
+            logger.info(f"✅ Stored incoming message from {chat_id} in Salesforce for {object_name} {record_id}")
+        else:
+            logger.error(f"❌ Failed to store incoming message from {chat_id}")
+        
+        return success
+        
+    except Exception as e:
+        logger.error(f"❌ Error storing incoming message: {e}")
+        return False
+
+def find_lead_by_chat_id(self, chat_id):
+    """Find Lead by existing Chat ID"""
+    try:
+        access_token = self.get_salesforce_token()
+        if not access_token:
+            return None
+        
+        query = f"SELECT Id, Name, FirstName, LastName, Company, Phone, Email FROM Lead WHERE {SF_CHAT_ID_FIELD} = '{chat_id}' LIMIT 1"
+        return self.salesforce_query(query, access_token)
+        
+    except Exception as e:
+        logger.error(f"Error finding lead by chat ID: {e}")
+        return None
     
     def create_conversation_thread(self, contact_id, chat_id):
         """Create a conversation thread for tracking messages"""
