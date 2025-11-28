@@ -257,6 +257,7 @@ class SalesforceManager:
                 return False
             
             contact_data = {
+                "Salutation": "Mr." if user_data.get('gender') == 'male' else "Ms.",
                 "FirstName": first_name,
                 "LastName": last_name,
                 "MobilePhone": phone_number,
