@@ -255,7 +255,7 @@ class SalesforceManager:
             return None
     
     def update_contact_chat_id(self, contact_id, chat_id, user_data):
-        """Update Contact with Telegram Chat ID"""
+        """Update Contact with Telegram Chat ID and create conversation thread"""
         try:
             access_token = self.get_salesforce_token()
             if not access_token:
@@ -278,6 +278,10 @@ class SalesforceManager:
             
             if response.status_code == 204:
                 logger.info(f"✅ Successfully updated Contact {contact_id} with Chat ID: {chat_id}")
+                
+                # Create or update conversation thread
+                self.create_or_update_conversation_thread(contact_id, chat_id, 'Contact', access_token)
+                
                 return True
             else:
                 logger.error(f"❌ Failed to update Contact {contact_id}: {response.status_code} - {response.text}")
@@ -285,6 +289,40 @@ class SalesforceManager:
                 
         except Exception as e:
             logger.error(f"❌ Error updating contact chat ID: {e}")
+            return False
+
+    def create_or_update_conversation_thread(self, record_id, chat_id, object_type, access_token):
+        """Create or update conversation thread for contact/lead"""
+        try:
+            # Check if thread already exists
+            query = f"SELECT Id FROM Conversation_Thread__c WHERE Telegram_Chat_ID__c = '{chat_id}' LIMIT 1"
+            existing_thread = self.salesforce_query(query, access_token)
+            
+            if existing_thread:
+                # Update existing thread
+                update_data = {
+                    "Status__c": "Active",
+                    "Last_Message_Date__c": time.strftime('%Y-%m-%dT%H:%M:%SZ')
+                }
+                return self.salesforce_update("Conversation_Thread__c", existing_thread['Id'], update_data, access_token)
+            else:
+                # Create new thread
+                thread_data = {
+                    "Name": f"Telegram Chat - {chat_id}",
+                    "Telegram_Chat_ID__c": str(chat_id),
+                    "Status__c": "Active",
+                    "Last_Message_Date__c": time.strftime('%Y-%m-%dT%H:%M:%SZ')
+                }
+                
+                if object_type == "Contact":
+                    thread_data["Contact__c"] = record_id
+                else:  # Lead
+                    thread_data["Lead__c"] = record_id
+                    
+                return self.salesforce_create("Conversation_Thread__c", thread_data, access_token)
+                
+        except Exception as e:
+            logger.error(f"❌ Error creating/updating conversation thread: {e}")
             return False
     
     def create_new_contact(self, first_name, last_name, phone_number, chat_id, user_data):
@@ -309,68 +347,109 @@ class SalesforceManager:
             
             if success:
                 logger.info(f"✅ Created new Contact for {first_name} {last_name} with phone {phone_number}")
+                
+                # Now create a conversation thread for this new contact
+                # First, get the contact ID we just created
+                contact = self.find_contact_by_chat_id(chat_id)
+                if contact:
+                    thread_data = {
+                        "Name": f"Telegram Chat - {first_name} {last_name}",
+                        "Contact__c": contact['Id'],
+                        "Telegram_Chat_ID__c": str(chat_id),
+                        "Status__c": "Active",
+                        "Last_Message_Date__c": time.strftime('%Y-%m-%dT%H:%M:%SZ')
+                    }
+                    thread_success = self.salesforce_create("Conversation_Thread__c", thread_data, access_token)
+                    if thread_success:
+                        logger.info(f"✅ Created conversation thread for new contact {contact['Id']}")
+                    else:
+                        logger.error(f"❌ Failed to create conversation thread for new contact")
+                
+                return True
             else:
                 logger.error(f"❌ Failed to create new Contact for {first_name} {last_name}")
-            
-            return success
-            
+                return False
+                
         except Exception as e:
             logger.error(f"❌ Error creating new contact: {e}")
             return False
     
     def store_incoming_message(self, chat_id, message_text, telegram_message_id, user_data):
-        """Store incoming Telegram message in Salesforce"""
+        """Store incoming Telegram message in Salesforce using custom objects"""
         try:
             access_token = self.get_salesforce_token()
             if not access_token:
                 return False
             
-            # Find contact OR lead by chat ID
-            contact = self.find_contact_by_chat_id(chat_id)
-            lead = self.find_lead_by_chat_id(chat_id)
+            # Find conversation thread by Telegram Chat ID
+            query = f"SELECT Id, Contact__c, Lead__c FROM Conversation_Thread__c WHERE Telegram_Chat_ID__c = '{chat_id}' LIMIT 1"
+            thread = self.salesforce_query(query, access_token)
             
-            record_id = None
-            object_name = None
-            
-            if contact:
-                record_id = contact['Id']
-                object_name = "Contact"
-            elif lead:
-                record_id = lead['Id'] 
-                object_name = "Lead"
-            else:
-                logger.error(f"❌ No contact or lead found for chat ID: {chat_id}")
+            if not thread:
+                logger.error(f"❌ No conversation thread found for chat ID: {chat_id}")
                 return False
             
-            # Create a Task to represent the incoming message
+            # Create conversation message record
+            message_data = {
+                "Conversation_Thread__c": thread['Id'],
+                "Message_Text__c": message_text,
+                "Direction__c": "Inbound",
+                "Message_Date__c": time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                "Telegram_Message_ID__c": str(telegram_message_id),
+                "Status__c": "Received"
+            }
+            
+            success = self.salesforce_create("Conversation_Message__c", message_data, access_token)
+            
+            if success:
+                # Update thread's last message date
+                update_data = {
+                    "Last_Message_Date__c": time.strftime('%Y-%m-%dT%H:%M:%SZ')
+                }
+                self.salesforce_update("Conversation_Thread__c", thread['Id'], update_data, access_token)
+                
+                logger.info(f"✅ Stored incoming message in custom objects for chat {chat_id}")
+                
+                # Also create a task for agent notification (optional)
+                self.create_agent_notification_task(thread, message_text, user_data, access_token)
+                
+                return True
+            else:
+                logger.error(f"❌ Failed to store incoming message for chat {chat_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Error storing incoming message in custom objects: {e}")
+            return False
+
+    def create_agent_notification_task(self, thread, message_text, user_data, access_token):
+        """Create a task to notify agents about new incoming message"""
+        try:
+            record_id = thread.get('Contact__c') or thread.get('Lead__c')
+            if not record_id:
+                return False
+                
             task_data = {
-                "Subject": "Incoming Telegram Message",
-                "Status": "Completed",
-                "Priority": "Normal",
-                "Description": f"From: {user_data.get('first_name', 'Unknown')} {user_data.get('last_name', '')}\n"
-                            f"Username: @{user_data.get('username', 'N/A')}\n"
-                            f"Message: {message_text}\n"
-                            f"Telegram Message ID: {telegram_message_id}",
+                "Subject": "New Telegram Message - Action Required",
+                "Status": "Not Started",
+                "Priority": "High",
+                "Description": f"📱 **New Telegram Message Received**\n\n" +
+                            f"**Message:** {message_text}\n" +
+                            f"**From:** {user_data.get('first_name', 'Unknown')} {user_data.get('last_name', '')}\n" +
+                            f"**Username:** @{user_data.get('username', 'N/A')}\n" +
+                            f"**Received:** {time.strftime('%Y-%m-%d %H:%M:%S')}",
                 "ActivityDate": time.strftime('%Y-%m-%d')
             }
             
-            # Link to correct object
-            if object_name == "Contact":
+            if str(record_id).startswith('003'):  # Contact
                 task_data["WhoId"] = record_id
             else:  # Lead
                 task_data["WhatId"] = record_id
             
-            success = self.salesforce_create("Task", task_data, access_token)
-            
-            if success:
-                logger.info(f"✅ Stored incoming message from {chat_id} in Salesforce for {object_name} {record_id}")
-            else:
-                logger.error(f"❌ Failed to store incoming message from {chat_id}")
-            
-            return success
+            return self.salesforce_create("Task", task_data, access_token)
             
         except Exception as e:
-            logger.error(f"❌ Error storing incoming message: {e}")
+            logger.error(f"❌ Error creating agent notification task: {e}")
             return False
     
     def create_conversation_thread(self, contact_id, chat_id):
