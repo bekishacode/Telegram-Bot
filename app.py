@@ -299,30 +299,22 @@ class SalesforceManager:
             existing_thread = self.salesforce_query(query, access_token)
             
             if existing_thread:
-                # If thread exists but is closed, start new session
-                if existing_thread.get('Status__c') == 'Closed':
-                    update_data = {
-                        "Status__c": "Active",
-                        "Session_Count__c": (existing_thread.get('Session_Count__c', 0) or 0) + 1,
-                        "Last_Message_Date__c": time.strftime('%Y-%m-%dT%H:%M:%SZ')
-                    }
-                    success = self.salesforce_update("Conversation_Thread__c", existing_thread['Id'], update_data, access_token)
-                    if success:
-                        logger.info(f"✅ Started new session for existing thread {existing_thread['Id']}")
-                else:
-                    # Just update last message date for active thread
-                    update_data = {
-                        "Last_Message_Date__c": time.strftime('%Y-%m-%dT%H:%M:%SZ')
-                    }
-                    self.salesforce_update("Conversation_Thread__c", existing_thread['Id'], update_data, access_token)
+                # If thread exists but is closed, DON'T auto-start session during registration
+                # Only update last message date
+                update_data = {
+                    "Last_Message_Date__c": time.strftime('%Y-%m-%dT%H:%M:%SZ')
+                }
+                self.salesforce_update("Conversation_Thread__c", existing_thread['Id'], update_data, access_token)
+                logger.info(f"✅ Updated existing thread {existing_thread['Id']} timestamp")
                 
                 return True
             else:
-                # Create new thread with first session
+                # Create new thread with CLOSED status for registration
+                # Sessions should only start when agent initiates conversation
                 thread_data = {
                     "Name": f"Telegram Chat - {chat_id}",
                     "Telegram_Chat_ID__c": str(chat_id),
-                    "Status__c": "Active",
+                    "Status__c": "Closed",  # CHANGED: Closed instead of Active
                     "Session_Count__c": 1,
                     "Last_Message_Date__c": time.strftime('%Y-%m-%dT%H:%M:%SZ')
                 }
@@ -334,7 +326,7 @@ class SalesforceManager:
                     
                 success = self.salesforce_create("Conversation_Thread__c", thread_data, access_token)
                 if success:
-                    logger.info(f"✅ Created new conversation thread for {object_type} {record_id}")
+                    logger.info(f"✅ Created new conversation thread with CLOSED status for {object_type} {record_id}")
                 return success
                 
         except Exception as e:
@@ -364,14 +356,14 @@ class SalesforceManager:
             if success:
                 logger.info(f"✅ Created new Contact for {first_name} {last_name} with phone {phone_number}")
                 
-                # Now create a conversation thread with session management
+                # Create a conversation thread with CLOSED status (no auto session)
                 contact = self.find_contact_by_chat_id(chat_id)
                 if contact:
                     thread_data = {
                         "Name": f"Telegram Chat - {first_name} {last_name}",
                         "Contact__c": contact['Id'],
                         "Telegram_Chat_ID__c": str(chat_id),
-                        "Status__c": "Active",
+                        "Status__c": "Closed",
                         "Session_Count__c": 1,
                         "Last_Message_Date__c": time.strftime('%Y-%m-%dT%H:%M:%SZ')
                     }
@@ -448,9 +440,10 @@ class SalesforceManager:
             
             # If thread is closed, start new session
             if thread.get('Status__c') == 'Closed':
+                            # Keep thread closed - don't auto-start session
+                logger.info(f"ℹ️ Thread {thread['Id']} is closed - waiting for agent to start session")
+                # Just update timestamp but keep status closed
                 update_data = {
-                    "Status__c": "Active",
-                    "Session_Count__c": (thread.get('Session_Count__c', 0) or 0) + 1,
                     "Last_Message_Date__c": time.strftime('%Y-%m-%dT%H:%M:%SZ')
                 }
                 self.salesforce_update("Conversation_Thread__c", thread['Id'], update_data, access_token)
