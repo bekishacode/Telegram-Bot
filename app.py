@@ -38,7 +38,6 @@ logger = logging.getLogger(__name__)
 
 # In-memory storage for user states (use Redis in production)
 user_states = {}
-support_requests = {}  # Track users who have submitted support requests
 
 class SalesforceAuth:
     """Handles Salesforce OAuth 2.0 authentication"""
@@ -395,73 +394,76 @@ def clean_phone_number(phone):
 
 def handle_registered_user(chat_id, message, user_data):
     """Handle messages from registered users"""
-    message = message.strip().lower()
+    message_text = message.strip().lower()
+    chat_id_str = str(chat_id)
     
-    # Check thread status first
-    thread = bot_manager.get_thread_status(chat_id)
+    logger.info(f"👤 Registered user {chat_id} sent: {message_text}")
     
-    if not thread:
-        # No thread exists, show main menu
-        show_main_menu(chat_id, user_data)
+    # Check if user is in the middle of support request
+    if chat_id_str in user_states and user_states[chat_id_str].get('step') == 'support_request':
+        # This is their support request description
+        send_to_salesforce(chat_id, message, user_data)
+        
+        # Clear the support request state
+        user_states.pop(chat_id_str, None)
+        
+        bot_manager.send_message(chat_id,
+            '✅ Your request has been received!\n\n'
+            'An agent will contact you shortly. '
+            'Please wait for their response.'
+        )
         return
     
-    thread_status = thread.get('Status__c')
-    is_assigned = thread.get('Assigned__c', False)
+    # Check thread status
+    thread = bot_manager.get_thread_status(chat_id)
     
-    logger.info(f"🧵 Thread status: {thread_status}, Assigned: {is_assigned}")
-    
-    # Handle based on thread status
-    if thread_status == 'Closed':
-        # Show main menu for closed threads
-        if message == '2' or 'support' in message or 'contact' in message:
-            # Start new support request
-            support_requests[chat_id] = True
-            bot_manager.send_message(chat_id,
-                '💬 Please describe your request or question:\n'
-                '(Our support team will assist you shortly)'
-            )
-        elif message == '1' or 'track' in message:
-            bot_manager.send_message(chat_id,
-                '📋 Case tracking feature is coming soon!\n\n'
-                'Please choose an option:\n'
-                '1️⃣ Track your Case\n'
-                '2️⃣ Contact Customer Support'
-            )
-        else:
-            show_main_menu(chat_id, user_data)
-    
-    elif thread_status == 'Waiting for Agent':
-        # User has already submitted a request
-        if chat_id in support_requests:
-            # This is their support request description
+    if thread:
+        thread_status = thread.get('Status__c')
+        is_assigned = thread.get('Assigned__c', False)
+        
+        logger.info(f"🧵 Thread status: {thread_status}, Assigned: {is_assigned}")
+        
+        if thread_status == 'Active' and is_assigned:
+            # Active conversation with agent
             send_to_salesforce(chat_id, message, user_data)
-            del support_requests[chat_id]  # Remove from pending requests
-            
-            bot_manager.send_message(chat_id,
-                '✅ Your request has been received!\n\n'
-                'An agent will contact you shortly. '
-                'Please wait for their response.'
-            )
-        else:
-            # User is sending additional messages while waiting
+            bot_manager.send_message(chat_id, '✅ Message sent to agent.')
+            return
+        elif thread_status == 'Active' and not is_assigned:
+            # Active but not assigned (shouldn't happen)
+            send_to_salesforce(chat_id, message, user_data)
+            return
+        elif thread_status == 'Waiting for Agent':
+            # Already submitted request, waiting
             bot_manager.send_message(chat_id,
                 '⏳ Your request is still waiting for an agent.\n\n'
                 'Please wait for an agent to accept your request.'
             )
+            return
     
-    elif thread_status == 'Active' and is_assigned:
-        # Active conversation with agent - forward all messages
-        send_to_salesforce(chat_id, message, user_data)
+    # Handle menu selection for closed/new threads
+    if message_text == '1' or 'track' in message_text:
         bot_manager.send_message(chat_id,
-            '✅ Message sent to agent.'
+            '📋 Case tracking feature is coming soon!\n\n'
+            'Please choose an option:\n'
+            '1️⃣ Track your Case\n'
+            '2️⃣ Contact Customer Support'
         )
-    
-    elif thread_status == 'Active' and not is_assigned:
-        # Thread is active but not assigned (shouldn't happen)
-        send_to_salesforce(chat_id, message, user_data)
-    
+    elif message_text == '2' or 'support' in message_text or 'contact' in message_text:
+        # Start support request
+        user_states[chat_id_str] = {
+            'step': 'support_request',
+            'user_data': user_data
+        }
+        
+        # Send to Salesforce to create/update thread
+        send_to_salesforce(chat_id, "Customer selected: Contact Customer Support", user_data)
+        
+        bot_manager.send_message(chat_id,
+            '💬 Please describe your request or question:\n'
+            '(Our support team will assist you shortly)'
+        )
     else:
-        # Unknown status, show main menu
+        # Show main menu
         show_main_menu(chat_id, user_data)
 
 def show_main_menu(chat_id, user_data):
@@ -502,34 +504,6 @@ def send_to_salesforce(chat_id, message, user_data):
         logger.error(f"❌ Error sending to Salesforce: {e}")
         return False
 
-# Flask routes
-@app.route('/api/send-to-user', methods=['POST'])
-def send_to_user():
-    """Endpoint for Salesforce to send messages to Telegram"""
-    try:
-        data = request.get_json()
-        
-        if not data or 'chat_id' not in data or 'message' not in data:
-            return jsonify({'error': 'Missing chat_id or message'}), 400
-        
-        chat_id = data['chat_id']
-        message = data['message']
-        
-        success = bot_manager.send_message(chat_id, message)
-        
-        if success:
-            return jsonify({
-                'status': 'success', 
-                'message': 'Message sent to Telegram',
-                'chat_id': chat_id
-            })
-        else:
-            return jsonify({'error': 'Failed to send message to Telegram'}), 500
-            
-    except Exception as e:
-        logger.error(f"❌ Send error: {e}")
-        return jsonify({'error': str(e)}), 500
-
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
     """Receive Telegram webhook"""
@@ -547,15 +521,7 @@ def telegram_webhook():
                 
                 logger.info(f"📥 Message from {chat_id}: {message_text}")
                 
-                # Check if user is already registered
-                existing_contact = bot_manager.check_existing_contact(chat_id)
-                
-                if existing_contact:
-                    # Registered user - handle based on thread status
-                    handle_registered_user(chat_id, message_text, user_data)
-                    return jsonify({'status': 'ok'})
-                
-                # Handle /start command for unregistered users
+                # Handle /start command
                 if message_text == '/start':
                     bot_manager.send_message(chat_id,
                         '👋 Welcome to Bank of Abyssinia!\n\n'
@@ -563,128 +529,16 @@ def telegram_webhook():
                     )
                     return jsonify({'status': 'ok'})
                 
-                # Check if we have registration state for this user
-                user_state = user_states.get(str(chat_id))
+                # Check if user is already registered
+                existing_contact = bot_manager.check_existing_contact(chat_id)
                 
-                if not user_state:
-                    # Start new registration flow
-                    if is_phone_number(message_text):
-                        # User sent phone number
-                        clean_phone = clean_phone_number(message_text)
-                        logger.info(f"📞 Checking phone: {clean_phone}")
-                        
-                        bot_manager.send_message(chat_id,
-                            '📞 Checking your phone number...'
-                        )
-                        
-                        # Check if contact exists
-                        contact = bot_manager.find_contact_by_phone(clean_phone)
-                        
-                        if contact:
-                            # Update existing contact with Telegram Chat ID
-                            success = bot_manager.update_contact_chat_id(contact['Id'], chat_id)
-                            if success:
-                                show_main_menu(chat_id, user_data)
-                            else:
-                                bot_manager.send_message(chat_id,
-                                    '❌ Failed to connect your account. Please try again.'
-                                )
-                        else:
-                            # Start new registration
-                            user_states[str(chat_id)] = {
-                                'phone': clean_phone,
-                                'step': 'gender',
-                                'user_data': user_data
-                            }
-                            bot_manager.send_message(chat_id,
-                                '📝 New registration detected.\n\n'
-                                'Please select your gender:\n'
-                                '• Male\n'
-                                '• Female'
-                            )
-                    
-                    elif is_email(message_text):
-                        # User sent email
-                        bot_manager.send_message(chat_id,
-                            '📧 Checking your email address...'
-                        )
-                        
-                        contact = bot_manager.find_contact_by_email(message_text)
-                        
-                        if contact:
-                            # Update existing contact with Telegram Chat ID
-                            success = bot_manager.update_contact_chat_id(contact['Id'], chat_id)
-                            if success:
-                                show_main_menu(chat_id, user_data)
-                            else:
-                                bot_manager.send_message(chat_id,
-                                    '❌ Failed to connect your account. Please try again.'
-                                )
-                        else:
-                            bot_manager.send_message(chat_id,
-                                '❌ No account found with this email.\n\n'
-                                'Please share your phone number to create a new account.'
-                            )
-                    
-                    else:
-                        # Ask for phone/email
-                        bot_manager.send_message(chat_id,
-                            '👋 Welcome! To get started, please share:\n\n'
-                            '• Your phone number (0912121212)\n'
-                            '• Or your email address'
-                        )
+                if existing_contact:
+                    # Registered user
+                    handle_registered_user(chat_id, message_text, user_data)
+                    return jsonify({'status': 'ok'})
                 
-                else:
-                    # Continue registration based on current step
-                    current_step = user_state.get('step')
-                    
-                    if current_step == 'gender':
-                        if message_text.lower() in ['male', 'female']:
-                            user_state['gender'] = message_text.lower()
-                            user_state['step'] = 'name'
-                            user_states[str(chat_id)] = user_state
-                            
-                            bot_manager.send_message(chat_id,
-                                'Please enter your First Name and Last Name (separated by space):\n'
-                                'Example: John Smith'
-                            )
-                        else:
-                            bot_manager.send_message(chat_id,
-                                'Please select your gender:\n'
-                                '• Male\n'
-                                '• Female'
-                            )
-                    
-                    elif current_step == 'name':
-                        name_parts = message_text.split(' ', 1)
-                        if len(name_parts) >= 2:
-                            first_name = name_parts[0]
-                            last_name = name_parts[1]
-                            
-                            # Create new contact
-                            contact_id = bot_manager.create_new_contact(
-                                first_name=first_name,
-                                last_name=last_name,
-                                phone=user_state['phone'],
-                                gender=user_state['gender'],
-                                chat_id=chat_id
-                            )
-                            
-                            if contact_id:
-                                # Clear user state
-                                user_states.pop(str(chat_id), None)
-                                
-                                # Show main menu
-                                show_main_menu(chat_id, user_data)
-                            else:
-                                bot_manager.send_message(chat_id,
-                                    '❌ Sorry, we encountered an error creating your account. Please try again.'
-                                )
-                        else:
-                            bot_manager.send_message(chat_id,
-                                'Please enter both First Name and Last Name (separated by space):\n'
-                                'Example: John Smith'
-                            )
+                # Unregistered user - handle registration
+                handle_registration(chat_id, message_text, user_data)
             
             return jsonify({'status': 'ok'})
         else:
@@ -698,4 +552,126 @@ def telegram_webhook():
         )
         return jsonify({'error': str(e)}), 500
 
-# Health check and other endpoints remain the same...
+def handle_registration(chat_id, message_text, user_data):
+    """Handle user registration flow"""
+    chat_id_str = str(chat_id)
+    
+    # Check if we have registration state for this user
+    if chat_id_str not in user_states:
+        # Start new registration
+        if is_phone_number(message_text):
+            clean_phone = clean_phone_number(message_text)
+            logger.info(f"📞 Checking phone: {clean_phone}")
+            
+            bot_manager.send_message(chat_id,
+                '📞 Checking your phone number...'
+            )
+            
+            # Check if contact exists
+            contact = bot_manager.find_contact_by_phone(clean_phone)
+            
+            if contact:
+                # Update existing contact
+                success = bot_manager.update_contact_chat_id(contact['Id'], chat_id)
+                if success:
+                    show_main_menu(chat_id, user_data)
+                else:
+                    bot_manager.send_message(chat_id,
+                        '❌ Failed to connect your account. Please try again.'
+                    )
+            else:
+                # Start new registration
+                user_states[chat_id_str] = {
+                    'phone': clean_phone,
+                    'step': 'gender',
+                    'user_data': user_data
+                }
+                bot_manager.send_message(chat_id,
+                    '📝 New registration detected.\n\n'
+                    'Please select your gender:\n'
+                    '• Male\n'
+                    '• Female'
+                )
+        
+        elif is_email(message_text):
+            bot_manager.send_message(chat_id,
+                '📧 Checking your email address...'
+            )
+            
+            contact = bot_manager.find_contact_by_email(message_text)
+            
+            if contact:
+                success = bot_manager.update_contact_chat_id(contact['Id'], chat_id)
+                if success:
+                    show_main_menu(chat_id, user_data)
+                else:
+                    bot_manager.send_message(chat_id,
+                        '❌ Failed to connect your account. Please try again.'
+                    )
+            else:
+                bot_manager.send_message(chat_id,
+                    '❌ No account found with this email.\n\n'
+                    'Please share your phone number to create a new account.'
+                )
+        
+        else:
+            bot_manager.send_message(chat_id,
+                '👋 Welcome! To get started, please share:\n\n'
+                '• Your phone number (0912121212)\n'
+                '• Or your email address'
+            )
+    
+    else:
+        # Continue registration based on current step
+        state = user_states[chat_id_str]
+        current_step = state.get('step')
+        
+        if current_step == 'gender':
+            if message_text.lower() in ['male', 'female']:
+                state['gender'] = message_text.lower()
+                state['step'] = 'name'
+                user_states[chat_id_str] = state
+                
+                bot_manager.send_message(chat_id,
+                    'Please enter your First Name and Last Name (separated by space):\n'
+                    'Example: John Smith'
+                )
+            else:
+                bot_manager.send_message(chat_id,
+                    'Please select your gender:\n'
+                    '• Male\n'
+                    '• Female'
+                )
+        
+        elif current_step == 'name':
+            name_parts = message_text.split(' ', 1)
+            if len(name_parts) >= 2:
+                first_name = name_parts[0]
+                last_name = name_parts[1]
+                
+                # Create new contact
+                contact_id = bot_manager.create_new_contact(
+                    first_name=first_name,
+                    last_name=last_name,
+                    phone=state['phone'],
+                    gender=state['gender'],
+                    chat_id=chat_id
+                )
+                
+                if contact_id:
+                    # Clear user state
+                    user_states.pop(chat_id_str, None)
+                    
+                    # Show main menu
+                    show_main_menu(chat_id, user_data)
+                else:
+                    bot_manager.send_message(chat_id,
+                        '❌ Sorry, we encountered an error creating your account. Please try again.'
+                    )
+            else:
+                bot_manager.send_message(chat_id,
+                    'Please enter both First Name and Last Name (separated by space):\n'
+                    'Example: John Smith'
+                )
+
+# Other endpoints remain the same...
