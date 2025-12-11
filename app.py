@@ -89,7 +89,7 @@ class TelegramBotManager:
         self.sf_webhook = SALESFORCE_WEBHOOK_URL
         self.sf_auth = SalesforceAuth()
         
-    def send_message(self, chat_id, text):
+    def send_message(self, chat_id, text, reply_markup=None):
         """Send message to Telegram using direct API"""
         try:
             if not self.base_url:
@@ -102,6 +102,9 @@ class TelegramBotManager:
                 'text': text,
                 'parse_mode': 'HTML'
             }
+            
+            if reply_markup:
+                data['reply_markup'] = json.dumps(reply_markup)
             
             response = requests.post(url, data=data, timeout=30)
             result = response.json()
@@ -136,6 +139,7 @@ class TelegramBotManager:
             }
             
             logger.info(f"📤 Forwarding to Salesforce: {self.sf_webhook}")
+            logger.debug(f"Payload: {payload}")
             
             response = requests.post(
                 self.sf_webhook, 
@@ -144,7 +148,7 @@ class TelegramBotManager:
                 timeout=30
             )
             
-            logger.info(f"📤 Salesforce response: {response.status_code}")
+            logger.info(f"📤 Salesforce response: {response.status_code} - {response.text[:100]}")
             
             if response.status_code == 200:
                 logger.info(f"✅ Forwarded to Salesforce: {payload.get('chatId')}")
@@ -160,30 +164,6 @@ class TelegramBotManager:
         except Exception as e:
             logger.error(f"❌ Error forwarding to Salesforce: {e}")
             return False
-    
-    def test_salesforce_connection(self):
-        """Test Salesforce connection and permissions"""
-        try:
-            access_token = self.sf_auth.get_access_token()
-            if not access_token:
-                return False, "Failed to get access token"
-            
-            # Test a simple query to verify permissions
-            headers = {
-                'Authorization': f'Bearer {access_token}',
-                'Content-Type': 'application/json'
-            }
-            
-            test_url = f"{SF_INSTANCE_URL}/services/data/v58.0/query?q=SELECT+Id+FROM+Contact+LIMIT+1"
-            response = requests.get(test_url, headers=headers, timeout=30)
-            
-            if response.status_code == 200:
-                return True, "Salesforce connection successful"
-            else:
-                return False, f"Salesforce test failed: {response.status_code} - {response.text}"
-                
-        except Exception as e:
-            return False, f"Test connection error: {e}"
 
 # Initialize bot manager
 bot_manager = TelegramBotManager()
@@ -200,6 +180,20 @@ def is_email(text):
         return False
     email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     return re.match(email_pattern, text.strip()) is not None
+
+def clean_phone_number(phone):
+    """Clean phone number for Salesforce"""
+    if not phone:
+        return ""
+    # Remove all non-numeric characters
+    cleaned = re.sub(r'[^\d]', '', phone)
+    # Remove country code if present (251)
+    if cleaned.startswith('251'):
+        cleaned = cleaned[3:]
+    # Ensure it starts with 0
+    if not cleaned.startswith('0'):
+        cleaned = '0' + cleaned
+    return cleaned
 
 # Flask routes
 @app.route('/api/send-to-user', methods=['POST'])
@@ -229,77 +223,6 @@ def send_to_user():
         logger.error(f"❌ Send error: {e}")
         return jsonify({'error': str(e)}), 500
 
-# ... [Previous imports and setup remain the same] ...
-
-# Update the handle-unregistered endpoint to properly communicate with Salesforce
-@app.route('/api/handle-unregistered', methods=['POST'])
-def handle_unregistered():
-    """Handle unregistered users - registration flow"""
-    try:
-        data = request.get_json()
-        chat_id = data.get('chatId')
-        message = data.get('message', '')
-        
-        if not chat_id:
-            return jsonify({'error': 'Missing chatId'}), 400
-        
-        # Check if this is a phone number
-        if is_phone_number(message):
-            bot_manager.send_message(chat_id,
-                '📞 Checking your phone number...\n\n'
-                'If we find your account, you will be connected immediately.\n'
-                'If not, we will help you create a new account.'
-            )
-            
-            # Create proper payload for Salesforce
-            payload = {
-                'chatId': str(chat_id),
-                'userId': str(chat_id),  # Using chat_id as userId for now
-                'message': message,
-                'messageId': str(int(time.time())),
-                'timestamp': str(int(time.time())),
-                'firstName': data.get('firstName', ''),
-                'lastName': data.get('lastName', '')
-            }
-            
-            # Forward to Salesforce for processing
-            success = bot_manager.forward_to_salesforce(payload)
-            
-        # Check if this is an email
-        elif is_email(message):
-            bot_manager.send_message(chat_id,
-                '📧 Checking your email address...'
-            )
-            
-            # Create proper payload for Salesforce
-            payload = {
-                'chatId': str(chat_id),
-                'userId': str(chat_id),
-                'message': message,
-                'messageId': str(int(time.time())),
-                'timestamp': str(int(time.time())),
-                'firstName': data.get('firstName', ''),
-                'lastName': data.get('lastName', '')
-            }
-            
-            bot_manager.forward_to_salesforce(payload)
-            
-        else:
-            # Ask for phone/email
-            bot_manager.send_message(chat_id,
-                '👋 Welcome! To get started, please share:\n\n'
-                '• Your phone number (0912121212)\n'
-                '• Or your email address\n\n'
-                'We\'ll use this to find your account or create a new one.'
-            )
-        
-        return jsonify({'status': 'success'})
-            
-    except Exception as e:
-        logger.error(f"❌ Handle unregistered error: {e}")
-        return jsonify({'error': str(e)}), 500
-
-# Update the webhook to handle unregistered users properly
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
     """Receive Telegram webhook"""
@@ -325,45 +248,28 @@ def telegram_webhook():
                     )
                     return jsonify({'status': 'ok'})
                 
-                # Check if this is a phone number or email for unregistered user
-                if is_phone_number(message_text) or is_email(message_text):
-                    # Forward to unregistered handler endpoint
-                    unregistered_payload = {
-                        'chatId': str(chat_id),
-                        'message': message_text,
-                        'firstName': user_data.get('first_name', ''),
-                        'lastName': user_data.get('last_name', '')
-                    }
-                    
-                    # Call handle-unregistered endpoint
-                    response = requests.post(
-                        f'http://localhost:{PORT}/api/handle-unregistered',
-                        json=unregistered_payload,
-                        timeout=30
-                    )
-                    
-                    logger.info(f"Unregistered handler response: {response.status_code}")
-                    
+                # Prepare payload for Salesforce
+                payload = {
+                    'chatId': str(chat_id),
+                    'userId': str(user_data.get('id', '')),
+                    'message': message_text,
+                    'messageId': str(message_id),
+                    'timestamp': str(int(time.time())),
+                    'firstName': user_data.get('first_name', ''),
+                    'lastName': user_data.get('last_name', '')
+                }
+                
+                # Forward to Salesforce
+                success = bot_manager.forward_to_salesforce(payload)
+                
+                if success:
+                    return jsonify({'status': 'ok'})
                 else:
-                    # Prepare payload for Salesforce inbound handler
-                    payload = {
-                        'chatId': str(chat_id),
-                        'userId': str(user_data.get('id', chat_id)),
-                        'message': message_text,
-                        'messageId': str(message_id),
-                        'timestamp': str(int(time.time())),
-                        'firstName': user_data.get('first_name', ''),
-                        'lastName': user_data.get('last_name', '')
-                    }
-                    
-                    # Forward to Salesforce
-                    success = bot_manager.forward_to_salesforce(payload)
-                    
-                    if not success:
-                        # Send error message to user
-                        bot_manager.send_message(chat_id,
-                            '⚠️ We are experiencing technical difficulties. Please try again in a few moments.'
-                        )
+                    # Send error message to user
+                    bot_manager.send_message(chat_id,
+                        '⚠️ We are experiencing technical difficulties. Please try again in a few moments.'
+                    )
+                    return jsonify({'error': 'Failed to forward to Salesforce'}), 500
             
             return jsonify({'status': 'ok'})
         else:
@@ -373,8 +279,6 @@ def telegram_webhook():
     except Exception as e:
         logger.error(f"❌ Webhook error: {e}")
         return jsonify({'error': str(e)}), 500
-
-# ... [Rest of the code remains the same] ...
 
 # Set webhook endpoint
 @app.route('/set-webhook', methods=['GET'])
@@ -413,23 +317,23 @@ def set_webhook():
 @app.route('/test-salesforce', methods=['GET'])
 def test_salesforce():
     """Test Salesforce connection"""
-    success, message = bot_manager.test_salesforce_connection()
-    
-    if success:
+    try:
+        access_token = bot_manager.sf_auth.get_access_token()
+        if not access_token:
+            return jsonify({
+                'status': 'error',
+                'message': 'Failed to get access token'
+            }), 500
+        
         return jsonify({
             'status': 'success',
-            'message': message,
-            'instance_url': SF_INSTANCE_URL,
-            'client_id_set': bool(SF_CLIENT_ID),
-            'client_secret_set': bool(SF_CLIENT_SECRET)
+            'message': 'Salesforce connection successful',
+            'instance_url': SF_INSTANCE_URL
         })
-    else:
+    except Exception as e:
         return jsonify({
             'status': 'error',
-            'message': message,
-            'instance_url': SF_INSTANCE_URL,
-            'client_id_set': bool(SF_CLIENT_ID),
-            'client_secret_set': bool(SF_CLIENT_SECRET)
+            'message': f'Test connection error: {e}'
         }), 500
 
 # Check configuration endpoint
@@ -450,16 +354,20 @@ def config_check():
 # Health check
 @app.route('/health', methods=['GET'])
 def health_check():
-    # Test Salesforce connection
-    sf_connected, sf_message = bot_manager.test_salesforce_connection()
-    
-    return jsonify({
-        'status': 'healthy' if BOT_TOKEN and sf_connected else 'unhealthy',
-        'service': 'telegram-salesforce-bot',
-        'telegram_bot': '✅ Set' if BOT_TOKEN else '❌ Missing',
-        'salesforce_connection': '✅ Connected' if sf_connected else f'❌ {sf_message}',
-        'timestamp': time.time()
-    })
+    try:
+        access_token = bot_manager.sf_auth.get_access_token()
+        return jsonify({
+            'status': 'healthy' if BOT_TOKEN and access_token else 'unhealthy',
+            'service': 'telegram-salesforce-bot',
+            'telegram_bot': '✅ Set' if BOT_TOKEN else '❌ Missing',
+            'salesforce_connection': '✅ Connected' if access_token else '❌ Failed',
+            'timestamp': time.time()
+        })
+    except:
+        return jsonify({
+            'status': 'unhealthy',
+            'message': 'Health check failed'
+        }), 500
 
 @app.route('/')
 def home():
@@ -469,7 +377,6 @@ def home():
         'endpoints': {
             'webhook': 'POST /webhook',
             'send_to_user': 'POST /api/send-to-user',
-            'handle_unregistered': 'POST /api/handle-unregistered',
             'set_webhook': 'GET /set-webhook',
             'test_salesforce': 'GET /test-salesforce',
             'config': 'GET /config',
@@ -487,14 +394,6 @@ if __name__ == '__main__':
         logger.error(f"❌ Missing environment variables: {', '.join(missing_vars)}")
     else:
         logger.info("✅ All environment variables are set")
-        
-        # Test Salesforce connection on startup
-        logger.info("🔗 Testing Salesforce connection...")
-        sf_connected, sf_message = bot_manager.test_salesforce_connection()
-        if sf_connected:
-            logger.info("✅ Salesforce connection successful")
-        else:
-            logger.error(f"❌ Salesforce connection failed: {sf_message}")
     
     logger.info(f"🌐 Starting server on port {PORT}")
     app.run(host='0.0.0.0', port=PORT, debug=False)
