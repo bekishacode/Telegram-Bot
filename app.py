@@ -229,6 +229,9 @@ def send_to_user():
         logger.error(f"❌ Send error: {e}")
         return jsonify({'error': str(e)}), 500
 
+# ... [Previous imports and setup remain the same] ...
+
+# Update the handle-unregistered endpoint to properly communicate with Salesforce
 @app.route('/api/handle-unregistered', methods=['POST'])
 def handle_unregistered():
     """Handle unregistered users - registration flow"""
@@ -248,22 +251,46 @@ def handle_unregistered():
                 'If not, we will help you create a new account.'
             )
             
+            # Create proper payload for Salesforce
+            payload = {
+                'chatId': str(chat_id),
+                'userId': str(chat_id),  # Using chat_id as userId for now
+                'message': message,
+                'messageId': str(int(time.time())),
+                'timestamp': str(int(time.time())),
+                'firstName': data.get('firstName', ''),
+                'lastName': data.get('lastName', '')
+            }
+            
             # Forward to Salesforce for processing
-            bot_manager.forward_to_salesforce(data)
+            success = bot_manager.forward_to_salesforce(payload)
             
         # Check if this is an email
         elif is_email(message):
             bot_manager.send_message(chat_id,
                 '📧 Checking your email address...'
             )
-            bot_manager.forward_to_salesforce(data)
+            
+            # Create proper payload for Salesforce
+            payload = {
+                'chatId': str(chat_id),
+                'userId': str(chat_id),
+                'message': message,
+                'messageId': str(int(time.time())),
+                'timestamp': str(int(time.time())),
+                'firstName': data.get('firstName', ''),
+                'lastName': data.get('lastName', '')
+            }
+            
+            bot_manager.forward_to_salesforce(payload)
             
         else:
             # Ask for phone/email
             bot_manager.send_message(chat_id,
                 '👋 Welcome! To get started, please share:\n\n'
                 '• Your phone number (0912121212)\n'
-                '• Or your email address'
+                '• Or your email address\n\n'
+                'We\'ll use this to find your account or create a new one.'
             )
         
         return jsonify({'status': 'success'})
@@ -272,7 +299,7 @@ def handle_unregistered():
         logger.error(f"❌ Handle unregistered error: {e}")
         return jsonify({'error': str(e)}), 500
 
-# Webhook for Telegram
+# Update the webhook to handle unregistered users properly
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
     """Receive Telegram webhook"""
@@ -298,28 +325,45 @@ def telegram_webhook():
                     )
                     return jsonify({'status': 'ok'})
                 
-                # Prepare payload for Salesforce
-                payload = {
-                    'chatId': str(chat_id),
-                    'userId': str(user_data.get('id', '')),
-                    'message': message_text,
-                    'messageId': str(message_id),
-                    'timestamp': str(int(time.time())),
-                    'firstName': user_data.get('first_name', ''),
-                    'lastName': user_data.get('last_name', '')
-                }
-                
-                # Forward to Salesforce
-                success = bot_manager.forward_to_salesforce(payload)
-                
-                if success:
-                    return jsonify({'status': 'ok'})
-                else:
-                    # Send error message to user
-                    bot_manager.send_message(chat_id,
-                        '⚠️ We are experiencing technical difficulties. Please try again in a few moments.'
+                # Check if this is a phone number or email for unregistered user
+                if is_phone_number(message_text) or is_email(message_text):
+                    # Forward to unregistered handler endpoint
+                    unregistered_payload = {
+                        'chatId': str(chat_id),
+                        'message': message_text,
+                        'firstName': user_data.get('first_name', ''),
+                        'lastName': user_data.get('last_name', '')
+                    }
+                    
+                    # Call handle-unregistered endpoint
+                    response = requests.post(
+                        f'http://localhost:{PORT}/api/handle-unregistered',
+                        json=unregistered_payload,
+                        timeout=30
                     )
-                    return jsonify({'error': 'Failed to forward to Salesforce'}), 500
+                    
+                    logger.info(f"Unregistered handler response: {response.status_code}")
+                    
+                else:
+                    # Prepare payload for Salesforce inbound handler
+                    payload = {
+                        'chatId': str(chat_id),
+                        'userId': str(user_data.get('id', chat_id)),
+                        'message': message_text,
+                        'messageId': str(message_id),
+                        'timestamp': str(int(time.time())),
+                        'firstName': user_data.get('first_name', ''),
+                        'lastName': user_data.get('last_name', '')
+                    }
+                    
+                    # Forward to Salesforce
+                    success = bot_manager.forward_to_salesforce(payload)
+                    
+                    if not success:
+                        # Send error message to user
+                        bot_manager.send_message(chat_id,
+                            '⚠️ We are experiencing technical difficulties. Please try again in a few moments.'
+                        )
             
             return jsonify({'status': 'ok'})
         else:
@@ -329,6 +373,8 @@ def telegram_webhook():
     except Exception as e:
         logger.error(f"❌ Webhook error: {e}")
         return jsonify({'error': str(e)}), 500
+
+# ... [Rest of the code remains the same] ...
 
 # Set webhook endpoint
 @app.route('/set-webhook', methods=['GET'])
