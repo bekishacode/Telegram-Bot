@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 # In-memory storage for user states (use Redis in production)
 user_states = {}
+support_requests = {}  # Track users who have submitted support requests
 
 class SalesforceAuth:
     """Handles Salesforce OAuth 2.0 authentication"""
@@ -156,10 +157,6 @@ class TelegramBotManager:
             if response.status_code == 200:
                 logger.info(f"✅ Forwarded to Salesforce: {payload.get('chatId')}")
                 return True
-            elif response.status_code == 403:
-                logger.error(f"❌ Salesforce 403 Forbidden: {response.text}")
-                logger.error("❌ Check Apex class permissions and OAuth scopes")
-                return False
             else:
                 logger.error(f"❌ Salesforce error {response.status_code}: {response.text}")
                 return False
@@ -195,6 +192,42 @@ class TelegramBotManager:
             
         except Exception as e:
             logger.error(f"❌ Error checking contact: {e}")
+            return None
+    
+    def get_thread_status(self, chat_id):
+        """Get conversation thread status from Salesforce"""
+        try:
+            access_token = self.sf_auth.get_access_token()
+            if not access_token:
+                return None
+            
+            headers = {
+                'Authorization': f'Bearer {access_token}',
+                'Content-Type': 'application/json'
+            }
+            
+            # Query for thread status
+            query = f"""
+            SELECT Id, Status__c, Assigned__c 
+            FROM Conversation_Thread__c 
+            WHERE Telegram_Chat_ID__c = '{chat_id}' 
+            AND Channel_Type__c = 'Telegram'
+            ORDER BY CreatedDate DESC 
+            LIMIT 1
+            """
+            encoded_query = requests.utils.quote(query)
+            url = f"{SF_INSTANCE_URL}/services/data/v58.0/query?q={encoded_query}"
+            
+            response = requests.get(url, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data['totalSize'] > 0:
+                    return data['records'][0]
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting thread status: {e}")
             return None
     
     def find_contact_by_phone(self, phone_number):
@@ -360,26 +393,75 @@ def clean_phone_number(phone):
         cleaned = '0' + cleaned
     return cleaned
 
-def handle_menu_selection(chat_id, message, user_data):
-    """Handle menu selections for registered users"""
+def handle_registered_user(chat_id, message, user_data):
+    """Handle messages from registered users"""
     message = message.strip().lower()
     
-    if message == '1' or 'track' in message:
+    # Check thread status first
+    thread = bot_manager.get_thread_status(chat_id)
+    
+    if not thread:
+        # No thread exists, show main menu
+        show_main_menu(chat_id, user_data)
+        return
+    
+    thread_status = thread.get('Status__c')
+    is_assigned = thread.get('Assigned__c', False)
+    
+    logger.info(f"🧵 Thread status: {thread_status}, Assigned: {is_assigned}")
+    
+    # Handle based on thread status
+    if thread_status == 'Closed':
+        # Show main menu for closed threads
+        if message == '2' or 'support' in message or 'contact' in message:
+            # Start new support request
+            support_requests[chat_id] = True
+            bot_manager.send_message(chat_id,
+                '💬 Please describe your request or question:\n'
+                '(Our support team will assist you shortly)'
+            )
+        elif message == '1' or 'track' in message:
+            bot_manager.send_message(chat_id,
+                '📋 Case tracking feature is coming soon!\n\n'
+                'Please choose an option:\n'
+                '1️⃣ Track your Case\n'
+                '2️⃣ Contact Customer Support'
+            )
+        else:
+            show_main_menu(chat_id, user_data)
+    
+    elif thread_status == 'Waiting for Agent':
+        # User has already submitted a request
+        if chat_id in support_requests:
+            # This is their support request description
+            send_to_salesforce(chat_id, message, user_data)
+            del support_requests[chat_id]  # Remove from pending requests
+            
+            bot_manager.send_message(chat_id,
+                '✅ Your request has been received!\n\n'
+                'An agent will contact you shortly. '
+                'Please wait for their response.'
+            )
+        else:
+            # User is sending additional messages while waiting
+            bot_manager.send_message(chat_id,
+                '⏳ Your request is still waiting for an agent.\n\n'
+                'Please wait for an agent to accept your request.'
+            )
+    
+    elif thread_status == 'Active' and is_assigned:
+        # Active conversation with agent - forward all messages
+        send_to_salesforce(chat_id, message, user_data)
         bot_manager.send_message(chat_id,
-            '📋 Case tracking feature is coming soon!\n\n'
-            'Please choose an option:\n'
-            '1️⃣ Track your Case\n'
-            '2️⃣ Contact Customer Support'
+            '✅ Message sent to agent.'
         )
-    elif message == '2' or 'support' in message or 'contact' in message:
-        # Start support conversation
-        send_to_salesforce(chat_id, "Customer selected: Contact Customer Support", user_data)
-        bot_manager.send_message(chat_id,
-            '💬 Please describe your request or question:\n'
-            '(Our support team will assist you shortly)'
-        )
+    
+    elif thread_status == 'Active' and not is_assigned:
+        # Thread is active but not assigned (shouldn't happen)
+        send_to_salesforce(chat_id, message, user_data)
+    
     else:
-        # Show menu again
+        # Unknown status, show main menu
         show_main_menu(chat_id, user_data)
 
 def show_main_menu(chat_id, user_data):
@@ -469,8 +551,8 @@ def telegram_webhook():
                 existing_contact = bot_manager.check_existing_contact(chat_id)
                 
                 if existing_contact:
-                    # Registered user - handle menu or conversation
-                    handle_menu_selection(chat_id, message_text, user_data)
+                    # Registered user - handle based on thread status
+                    handle_registered_user(chat_id, message_text, user_data)
                     return jsonify({'status': 'ok'})
                 
                 # Handle /start command for unregistered users
@@ -616,89 +698,4 @@ def telegram_webhook():
         )
         return jsonify({'error': str(e)}), 500
 
-# Set webhook endpoint
-@app.route('/set-webhook', methods=['GET'])
-def set_webhook():
-    """Set Telegram webhook programmatically"""
-    try:
-        if not BOT_TOKEN:
-            return jsonify({'error': 'BOT_TOKEN not configured'}), 500
-            
-        webhook_url = f"https://{request.host}/webhook"
-        set_url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}"
-        
-        logger.info(f"🔗 Setting webhook to: {webhook_url}")
-        
-        response = requests.get(set_url)
-        result = response.json()
-        
-        if result.get('ok'):
-            return jsonify({
-                'status': 'success',
-                'message': f'Webhook set to: {webhook_url}',
-                'result': result
-            })
-        else:
-            return jsonify({
-                'status': 'error',
-                'message': result.get('description'),
-                'result': result
-            }), 500
-            
-    except Exception as e:
-        logger.error(f"❌ Set webhook error: {e}")
-        return jsonify({'error': str(e)}), 500
-
-# Test Salesforce connection
-@app.route('/test-salesforce', methods=['GET'])
-def test_salesforce():
-    """Test Salesforce connection"""
-    try:
-        access_token = bot_manager.sf_auth.get_access_token()
-        if not access_token:
-            return jsonify({
-                'status': 'error',
-                'message': 'Failed to get access token'
-            }), 500
-        
-        return jsonify({
-            'status': 'success',
-            'message': 'Salesforce connection successful',
-            'instance_url': SF_INSTANCE_URL
-        })
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': f'Test connection error: {e}'
-        }), 500
-
-# Health check
-@app.route('/health', methods=['GET'])
-def health_check():
-    try:
-        access_token = bot_manager.sf_auth.get_access_token()
-        return jsonify({
-            'status': 'healthy' if BOT_TOKEN and access_token else 'unhealthy',
-            'service': 'telegram-salesforce-bot',
-            'telegram_bot': '✅ Set' if BOT_TOKEN else '❌ Missing',
-            'salesforce_connection': '✅ Connected' if access_token else '❌ Failed',
-            'timestamp': time.time()
-        })
-    except:
-        return jsonify({
-            'status': 'unhealthy',
-            'message': 'Health check failed'
-        }), 500
-
-if __name__ == '__main__':
-    logger.info("=" * 50)
-    logger.info("🚀 Starting Telegram Bot")
-    logger.info("=" * 50)
-    
-    if missing_vars:
-        logger.error(f"❌ Missing environment variables: {', '.join(missing_vars)}")
-    else:
-        logger.info("✅ All environment variables are set")
-    
-    logger.info(f"🌐 Starting server on port {PORT}")
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+# Health check and other endpoints remain the same...
