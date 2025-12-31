@@ -237,39 +237,6 @@ class TelegramBotManager:
             logger.error(f"❌ Error finding contact by phone: {e}")
             return None
     
-    def find_contact_by_email(self, email):
-        """Find contact by email in Salesforce"""
-        try:
-            access_token = self.sf_auth.get_access_token()
-            if not access_token:
-                return None
-            
-            headers = {
-                'Authorization': f'Bearer {access_token}',
-                'Content-Type': 'application/json'
-            }
-            
-            query = f"""
-            SELECT Id, FirstName, LastName, Salutation, Phone, Email 
-            FROM Contact 
-            WHERE Email = '{email}'
-            LIMIT 1
-            """
-            encoded_query = requests.utils.quote(query)
-            url = f"{SF_INSTANCE_URL}/services/data/v58.0/query?q={encoded_query}"
-            
-            response = requests.get(url, headers=headers, timeout=30)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data['totalSize'] > 0:
-                    return data['records'][0]
-            return None
-            
-        except Exception as e:
-            logger.error(f"❌ Error finding contact by email: {e}")
-            return None
-    
     def get_active_sessions_for_user(self, channel_user_id):
         """Get active chat sessions for a channel user"""
         try:
@@ -306,7 +273,7 @@ class TelegramBotManager:
             logger.error(f"❌ Error getting active sessions: {e}")
             return []
     
-    def create_channel_user(self, telegram_id, contact_id=None, first_name=None, last_name=None, phone=None):
+    def create_channel_user(self, telegram_id, phone=None, contact_id=None, first_name=None, last_name=None):
         """Create Channel_User__c record"""
         try:
             access_token = self.sf_auth.get_access_token()
@@ -322,10 +289,10 @@ class TelegramBotManager:
             channel_user_url = f"{SF_INSTANCE_URL}/services/data/v58.0/sobjects/Channel_User__c/"
             
             # Generate a name for the channel user
-            if contact_id:
-                name = f'Telegram User: {telegram_id}'
-            elif first_name and last_name:
+            if first_name and last_name:
                 name = f'Telegram: {first_name} {last_name}'
+            elif phone:
+                name = f'Telegram: {phone}'
             else:
                 name = f'Telegram: {telegram_id}'
             
@@ -356,6 +323,36 @@ class TelegramBotManager:
             logger.error(f"❌ Error creating channel user: {e}")
             return None
     
+    def link_channel_user_to_contact(self, channel_user_id, contact_id):
+        """Link existing Channel_User__c to Contact"""
+        try:
+            access_token = self.sf_auth.get_access_token()
+            if not access_token:
+                return False
+            
+            headers = {
+                'Authorization': f'Bearer {access_token}',
+                'Content-Type': 'application/json'
+            }
+            
+            url = f"{SF_INSTANCE_URL}/services/data/v58.0/sobjects/Channel_User__c/{channel_user_id}"
+            data = {
+                'Contact__c': contact_id
+            }
+            
+            response = requests.patch(url, headers=headers, json=data, timeout=30)
+            
+            if response.status_code == 204:
+                logger.info(f"✅ Linked Channel_User__c {channel_user_id} to Contact {contact_id}")
+                return True
+            else:
+                logger.error(f"❌ Failed to link Channel_User__c: {response.status_code} - {response.text}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Error linking channel user: {e}")
+            return False
+    
     def update_contact_telegram_id(self, contact_id, telegram_id):
         """Update contact with Telegram Chat ID"""
         try:
@@ -385,41 +382,6 @@ class TelegramBotManager:
         except Exception as e:
             logger.error(f"❌ Error updating contact: {e}")
             return False
-    
-    def create_new_contact(self, first_name, last_name, phone, telegram_id):
-        """Create new contact in Salesforce"""
-        try:
-            access_token = self.sf_auth.get_access_token()
-            if not access_token:
-                return None
-            
-            headers = {
-                'Authorization': f'Bearer {access_token}',
-                'Content-Type': 'application/json'
-            }
-            
-            url = f"{SF_INSTANCE_URL}/services/data/v58.0/sobjects/Contact/"
-            data = {
-                'FirstName': first_name,
-                'LastName': last_name,
-                'MobilePhone': phone,
-                'Phone': phone,
-                'Telegram_Chat_ID__c': str(telegram_id)
-            }
-            
-            response = requests.post(url, headers=headers, json=data, timeout=30)
-            
-            if response.status_code == 201:
-                result = response.json()
-                logger.info(f"✅ Created new contact: {result['id']}")
-                return result['id']
-            else:
-                logger.error(f"❌ Failed to create contact: {response.status_code} - {response.text}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"❌ Error creating contact: {e}")
-            return None
     
     def send_typing_action(self, chat_id):
         """Send typing action to Telegram"""
@@ -460,12 +422,6 @@ def is_phone_number(text):
         return False
     phone_pattern = r'^(\+?251|0)?[97]\d{8}$'
     return re.match(phone_pattern, text.strip()) is not None
-
-def is_email(text):
-    if not text:
-        return False
-    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-    return re.match(email_pattern, text.strip()) is not None
 
 def show_main_menu(chat_id, user_name=None):
     """Show main menu with options"""
@@ -518,7 +474,6 @@ Please describe your issue or question, and our team will assist you shortly.
             """
             
             # Send a message to Salesforce to trigger session creation
-            # The webhook will handle creating the session and assigning to queue
             payload = {
                 'channelType': 'Telegram',
                 'chatId': str(chat_id),
@@ -549,143 +504,6 @@ For now, please contact customer support for case updates.
     """
     return bot_manager.send_message(chat_id, response_text, parse_mode='Markdown')
 
-def handle_registration_flow(chat_id, message_text, user_data):
-    """Handle user registration flow"""
-    chat_id_str = str(chat_id)
-    
-    if chat_id_str not in user_registration_state:
-        # Start registration - ask for phone number
-        user_registration_state[chat_id_str] = {
-            'step': 'phone',
-            'user_data': user_data
-        }
-        
-        response_text = """
-📱 *Registration*
-
-To get started, please share your phone number:
-
-Example: *0912121212*
-
-We'll check if you already have an account with us.
-        """
-        return bot_manager.send_message(chat_id, response_text, parse_mode='Markdown')
-    
-    state = user_registration_state[chat_id_str]
-    
-    if state['step'] == 'phone':
-        if is_phone_number(message_text):
-            clean_phone = bot_manager.clean_phone_number(message_text)
-            
-            # Look for existing contact by phone
-            contact = bot_manager.find_contact_by_phone(clean_phone)
-            
-            if contact:
-                # Found existing contact
-                state['step'] = 'found_contact'
-                state['phone'] = clean_phone
-                state['contact_id'] = contact['Id']
-                state['first_name'] = contact.get('FirstName')
-                state['last_name'] = contact.get('LastName')
-                user_registration_state[chat_id_str] = state
-                
-                # Create channel user for existing contact
-                channel_user_id = bot_manager.create_channel_user(
-                    telegram_id=chat_id,
-                    contact_id=contact['Id']
-                )
-                
-                if channel_user_id:
-                    # Update contact with Telegram ID
-                    bot_manager.update_contact_telegram_id(contact['Id'], chat_id)
-                    
-                    # Registration complete
-                    user_registration_state.pop(chat_id_str, None)
-                    
-                    # Show welcome message with name
-                    contact_name = contact.get('FirstName', 'Customer')
-                    welcome_text = f"""
-✅ *Welcome back, {contact_name}!*
-
-You're now connected to our support system.
-                    """
-                    bot_manager.send_message(chat_id, welcome_text, parse_mode='Markdown')
-                    
-                    # Show main menu
-                    return show_main_menu(chat_id, contact_name)
-                else:
-                    error_text = "❌ *Sorry, there was an error creating your account. Please try again.*"
-                    return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
-            else:
-                # No contact found - ask for name
-                state['step'] = 'name'
-                state['phone'] = clean_phone
-                user_registration_state[chat_id_str] = state
-                
-                response_text = """
-📝 *New Account*
-
-We couldn't find an account with this phone number.
-
-Please provide your *First Name* and *Last Name* (separated by space):
-
-Example: *John Smith*
-                """
-                return bot_manager.send_message(chat_id, response_text, parse_mode='Markdown')
-        else:
-            response_text = "📱 *Please enter a valid phone number:*\n\nExample: *0912121212*"
-            return bot_manager.send_message(chat_id, response_text, parse_mode='Markdown')
-    
-    elif state['step'] == 'name':
-        name_parts = message_text.strip().split()
-        if len(name_parts) >= 2:
-            first_name = name_parts[0]
-            last_name = ' '.join(name_parts[1:])
-            
-            # Create new contact
-            contact_id = bot_manager.create_new_contact(
-                first_name=first_name,
-                last_name=last_name,
-                phone=state['phone'],
-                telegram_id=chat_id
-            )
-            
-            if contact_id:
-                # Create channel user
-                channel_user_id = bot_manager.create_channel_user(
-                    telegram_id=chat_id,
-                    contact_id=contact_id,
-                    first_name=first_name,
-                    last_name=last_name
-                )
-                
-                if channel_user_id:
-                    # Registration complete
-                    user_registration_state.pop(chat_id_str, None)
-                    
-                    welcome_text = f"""
-✅ *Registration Successful!*
-
-Welcome, {first_name}! You're now connected to our support system.
-                    """
-                    bot_manager.send_message(chat_id, welcome_text, parse_mode='Markdown')
-                    
-                    # Show main menu
-                    return show_main_menu(chat_id, first_name)
-                else:
-                    error_text = "❌ *Sorry, there was an error creating your account. Please try again.*"
-                    return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
-            else:
-                error_text = "❌ *Sorry, there was an error creating your account. Please try again.*"
-                return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
-        else:
-            response_text = """
-📝 *Please provide both your First Name and Last Name:*
-
-Example: *John Smith*
-            """
-            return bot_manager.send_message(chat_id, response_text, parse_mode='Markdown')
-
 def process_incoming_message(chat_id, message_text, user_data):
     """Process incoming Telegram message"""
     try:
@@ -695,16 +513,84 @@ def process_incoming_message(chat_id, message_text, user_data):
         chat_id_str = str(chat_id)
         message_lower = message_text.strip().lower()
         
-        # Check if user is in registration flow
-        if chat_id_str in user_registration_state:
-            handle_registration_flow(chat_id, message_text, user_data)
-            return
+        logger.info(f"📥 Processing message from {chat_id}: {message_text}")
         
-        # Check if user exists in Channel_User__c
+        # STEP 1: Check if Channel_User__c exists
         channel_user = bot_manager.check_existing_channel_user(chat_id_str)
         
-        if not channel_user:
-            # New user - start registration
+        if channel_user:
+            # ✅ Channel User EXISTS - Show main menu or process message
+            logger.info(f"✅ Existing Channel User found: {channel_user['Id']}")
+            
+            # Get user info for personalized greeting
+            user_name = None
+            if channel_user.get('Contact__r'):
+                user_name = channel_user['Contact__r'].get('FirstName')
+            elif user_data:
+                user_name = user_data.get('first_name')
+            
+            # Check menu selection
+            if message_lower in ['1', 'contact', 'support', 'contact support', 'customer support']:
+                return handle_contact_support(
+                    chat_id, 
+                    channel_user['Id'], 
+                    channel_user['Contact__r'].get('FirstName') if channel_user.get('Contact__r') else user_data.get('first_name'),
+                    channel_user['Contact__r'].get('LastName') if channel_user.get('Contact__r') else user_data.get('last_name')
+                )
+            
+            elif message_lower in ['2', 'track', 'track case', 'case', 'my case']:
+                return handle_track_case(chat_id)
+            
+            elif message_lower == '/start':
+                # Show main menu for existing users
+                return show_main_menu(chat_id, user_name)
+            
+            elif message_lower in ['hi', 'hello', 'hey', 'help']:
+                # Greeting - show menu
+                return show_main_menu(chat_id, user_name)
+            
+            else:
+                # Regular message - forward to Salesforce
+                logger.info(f"📤 Forwarding message to Salesforce from user {chat_id}")
+                
+                # Create payload for Salesforce webhook
+                payload = {
+                    'channelType': 'Telegram',
+                    'chatId': chat_id_str,
+                    'message': message_text,
+                    'messageId': f"TG_{int(time.time())}",
+                    'firstName': user_data.get('first_name', ''),
+                    'lastName': user_data.get('last_name', ''),
+                    'username': user_data.get('username', ''),
+                    'languageCode': user_data.get('language_code', 'en')
+                }
+                
+                # Add contact info if available
+                if channel_user.get('Contact__r'):
+                    payload['contactId'] = channel_user['Contact__r'].get('Id')
+                
+                # Forward to Salesforce
+                success = bot_manager.forward_to_salesforce(payload)
+                
+                if success:
+                    # Send confirmation for support-related messages
+                    if len(message_text) > 3 and message_lower not in ['ok', 'thanks', 'thank you']:
+                        bot_manager.send_message(
+                            chat_id,
+                            "✅ *Message received.*\n\nOur support team will respond shortly.",
+                            parse_mode='Markdown'
+                        )
+                else:
+                    bot_manager.send_message(
+                        chat_id,
+                        "❌ *Sorry, there was an error processing your message. Please try again.*",
+                        parse_mode='Markdown'
+                    )
+        
+        else:
+            # ❌ Channel User DOES NOT EXIST - Start registration
+            logger.info(f"❌ No Channel User found for {chat_id}")
+            
             if message_lower == '/start':
                 welcome_text = """
 👋 *Welcome to Bank of Abyssinia Support!*
@@ -717,77 +603,82 @@ Example: *0912121212*
                 """
                 bot_manager.send_message(chat_id, welcome_text, parse_mode='Markdown')
                 return
-            else:
-                # Start registration
-                handle_registration_flow(chat_id, message_text, user_data)
-                return
-        
-        # Existing user - check menu selection
-        if message_lower in ['1', 'contact', 'support', 'contact support', 'customer support']:
-            # Get user info
-            first_name = None
-            last_name = None
             
-            if channel_user.get('Contact__r'):
-                first_name = channel_user['Contact__r'].get('FirstName')
-                last_name = channel_user['Contact__r'].get('LastName')
-            elif user_data:
-                first_name = user_data.get('first_name')
-                last_name = user_data.get('last_name')
-            
-            handle_contact_support(chat_id, channel_user['Id'], first_name, last_name)
-            
-        elif message_lower in ['2', 'track', 'track case', 'case', 'my case']:
-            handle_track_case(chat_id)
-            
-        elif message_lower == '/start':
-            # Show main menu for existing users
-            user_name = None
-            if channel_user.get('Contact__r'):
-                user_name = channel_user['Contact__r'].get('FirstName')
-            elif user_data:
-                user_name = user_data.get('first_name')
-            
-            show_main_menu(chat_id, user_name)
-            
-        else:
-            # Regular message - forward to Salesforce
-            logger.info(f"👤 Existing user {chat_id}: {message_text}")
-            
-            # Create payload for Salesforce webhook
-            payload = {
-                'channelType': 'Telegram',
-                'chatId': chat_id_str,
-                'message': message_text,
-                'messageId': f"TG_{int(time.time())}",
-                'firstName': user_data.get('first_name', ''),
-                'lastName': user_data.get('last_name', ''),
-                'username': user_data.get('username', ''),
-                'languageCode': user_data.get('language_code', 'en')
-            }
-            
-            # Add contact info if available
-            if channel_user.get('Contact__r'):
-                payload['contactId'] = channel_user['Contact__r'].get('Id')
-            
-            # Forward to Salesforce
-            success = bot_manager.forward_to_salesforce(payload)
-            
-            if success:
-                # Check if this is likely a support request (not a menu selection)
-                if message_lower not in ['hi', 'hello', 'hey', 'help'] and len(message_text) > 3:
-                    # Send confirmation
-                    bot_manager.send_message(
-                        chat_id,
-                        "✅ *Message received.*\n\nOur support team will respond shortly.",
-                        parse_mode='Markdown'
-                    )
-            else:
-                bot_manager.send_message(
-                    chat_id,
-                    "❌ *Sorry, there was an error processing your message. Please try again.*",
-                    parse_mode='Markdown'
+            elif is_phone_number(message_text):
+                # User provided phone number - create Channel User
+                clean_phone = bot_manager.clean_phone_number(message_text)
+                
+                logger.info(f"📱 Creating Channel User for {chat_id} with phone: {clean_phone}")
+                
+                # First, create Channel_User__c (WITHOUT contact link initially)
+                channel_user_id = bot_manager.create_channel_user(
+                    telegram_id=chat_id_str,
+                    phone=clean_phone
                 )
+                
+                if not channel_user_id:
+                    error_text = "❌ *Sorry, there was an error creating your account. Please try again.*"
+                    return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
+                
+                # Now check if Contact exists with this phone
+                contact = bot_manager.find_contact_by_phone(clean_phone)
+                
+                if contact:
+                    # ✅ Contact exists - link it to Channel User
+                    logger.info(f"✅ Found existing Contact: {contact['Id']}")
+                    
+                    # Link Channel User to Contact
+                    if bot_manager.link_channel_user_to_contact(channel_user_id, contact['Id']):
+                        # Update Contact with Telegram ID
+                        bot_manager.update_contact_telegram_id(contact['Id'], chat_id_str)
+                        
+                        # Show personalized welcome
+                        contact_name = contact.get('FirstName', 'Customer')
+                        welcome_text = f"""
+✅ *Welcome back, {contact_name}!*
+
+You're now connected to our support system.
+                        """
+                        bot_manager.send_message(chat_id, welcome_text, parse_mode='Markdown')
+                        
+                        # Show main menu
+                        return show_main_menu(chat_id, contact_name)
+                    else:
+                        # Link failed, but Channel User was created - continue with basic account
+                        logger.warning(f"⚠️ Failed to link Contact, but Channel User created: {channel_user_id}")
+                else:
+                    # ❌ No Contact found - that's OK, Channel User exists without Contact
+                    logger.info(f"⚠️ No Contact found for phone {clean_phone}, Channel User created without Contact link")
+                
+                # Show generic welcome (Channel User created, with or without Contact)
+                welcome_text = """
+✅ *Registration Successful!*
+
+You're now connected to our support system.
+                """
+                bot_manager.send_message(chat_id, welcome_text, parse_mode='Markdown')
+                
+                # Show main menu
+                return show_main_menu(chat_id)
+            
+            else:
+                # User didn't provide phone number
+                if chat_id_str in user_registration_state:
+                    # Already in registration flow
+                    error_text = "📱 *Please enter a valid phone number:*\n\nExample: *0912121212*"
+                else:
+                    # First message wasn't /start or phone
+                    error_text = """
+👋 *Welcome to Bank of Abyssinia Support!*
+
+To begin, please share your *phone number*:
+
+Example: *0912121212*
+
+Or type */start* to see the welcome message.
+                    """
+                
+                return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
                     
     except Exception as e:
         logger.error(f"❌ Error processing message: {e}")
@@ -797,7 +688,7 @@ Example: *0912121212*
             parse_mode='Markdown'
         )
 
-# Flask routes
+# Flask routes (same as before)
 @app.route('/api/send-to-user', methods=['POST'])
 def send_to_user():
     """Endpoint for Salesforce to send messages to Telegram"""
@@ -894,8 +785,8 @@ def test():
     return jsonify({
         'status': 'online',
         'service': 'Telegram Bot Integration',
-        'version': '2.0',
-        'workflow': 'Registration → Main Menu → Support Queue',
+        'version': '3.0',
+        'workflow': '1. Check Channel User → 2. Create if needed → 3. Link Contact if exists → 4. Main Menu',
         'endpoints': {
             'webhook': 'POST /webhook',
             'send_to_user': 'POST /api/send-to-user',
@@ -914,7 +805,7 @@ def health_check():
             'service': 'telegram-salesforce-bot',
             'telegram_bot': '✅ Set' if BOT_TOKEN else '❌ Missing',
             'salesforce_connection': '✅ Connected' if access_token else '❌ Failed',
-            'workflow': 'Registration → Menu → Support',
+            'workflow': 'Channel User First → Contact Linking Optional',
             'timestamp': time.time()
         })
     except:
@@ -927,13 +818,13 @@ def health_check():
 def home():
     return jsonify({
         'message': 'Telegram Bot for Salesforce Integration',
-        'workflow': '1. User Registration → 2. Main Menu → 3. Support Queue',
+        'workflow': '1. Check/Create Channel User → 2. Link Contact if exists → 3. Main Menu → 4. Support Queue',
         'status': 'Running'
     })
 
 if __name__ == '__main__':
     logger.info("=" * 50)
-    logger.info("🚀 Starting Telegram Bot v3.0 (Enhanced Workflow)")
+    logger.info("🚀 Starting Telegram Bot v3.0 (Channel User First Workflow)")
     logger.info("=" * 50)
     
     if missing_vars:
@@ -942,7 +833,7 @@ if __name__ == '__main__':
         logger.info("✅ All environment variables are set")
     
     logger.info("📱 Channel Type: Telegram")
-    logger.info("👤 Workflow: Registration → Menu → Support Queue")
-    logger.info("🏗️  System: New Messaging Architecture")
+    logger.info("👤 Workflow: Channel User First → Contact Optional → Menu → Support")
+    logger.info("🔗 Contact Linking: Optional (only if Contact exists)")
     logger.info(f"🌐 Starting server on port {PORT}")
     app.run(host='0.0.0.0', port=PORT, debug=False)
