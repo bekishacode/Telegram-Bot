@@ -237,8 +237,44 @@ class TelegramBotManager:
             logger.error(f"❌ Error finding contact by phone: {e}")
             return None
     
-    def get_active_sessions_for_user(self, channel_user_id):
-        """Get active chat sessions for a channel user"""
+    def get_active_support_conversation(self, channel_user_id):
+        """Get active Support Conversation for a channel user"""
+        try:
+            access_token = self.sf_auth.get_access_token()
+            if not access_token:
+                return None
+            
+            headers = {
+                'Authorization': f'Bearer {access_token}',
+                'Content-Type': 'application/json'
+            }
+            
+            query = f"""
+            SELECT Id, Name, Status__c, Channel_User_Name__c,
+                   Created_Date__c, Last_Activity_Date__c,
+                   Last_Message_Date__c
+            FROM Support_Conversation__c 
+            WHERE Channel_User_Name__c = '{channel_user_id}'
+            AND Status__c = 'Active'
+            LIMIT 1
+            """
+            encoded_query = requests.utils.quote(query)
+            url = f"{SF_INSTANCE_URL}/services/data/v58.0/query?q={encoded_query}"
+            
+            response = requests.get(url, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data['totalSize'] > 0:
+                    return data['records'][0]
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting active conversation: {e}")
+            return None
+    
+    def get_active_sessions(self, conversation_id):
+        """Get active chat sessions for a conversation"""
         try:
             access_token = self.sf_auth.get_access_token()
             if not access_token:
@@ -254,7 +290,7 @@ class TelegramBotManager:
                    Assigned_Agent__c, Assigned_Agent__r.Name,
                    Created_Date__c, Last_Message_Time__c
             FROM Chat_Session__c 
-            WHERE Channel_User__c = '{channel_user_id}'
+            WHERE Support_Conversation__c = '{conversation_id}'
             AND Status__c IN ('Active', 'Waiting')
             ORDER BY Created_Date__c DESC
             LIMIT 1
@@ -273,8 +309,8 @@ class TelegramBotManager:
             logger.error(f"❌ Error getting active sessions: {e}")
             return []
     
-    def create_channel_user(self, telegram_id, phone=None, contact_id=None, first_name=None, last_name=None):
-        """Create Channel_User__c record"""
+    def create_channel_user_with_conversation(self, telegram_id, phone=None, contact_id=None, first_name=None, last_name=None):
+        """Create Channel_User__c AND Support_Conversation__c together"""
         try:
             access_token = self.sf_auth.get_access_token()
             if not access_token:
@@ -285,7 +321,7 @@ class TelegramBotManager:
                 'Content-Type': 'application/json'
             }
             
-            # Create Channel_User__c
+            # 1. CREATE CHANNEL USER
             channel_user_url = f"{SF_INSTANCE_URL}/services/data/v58.0/sobjects/Channel_User__c/"
             
             # Generate a name for the channel user
@@ -309,18 +345,51 @@ class TelegramBotManager:
             if contact_id:
                 channel_user_data['Contact__c'] = contact_id
             
+            logger.info(f"📝 Creating Channel User for {telegram_id}")
             response = requests.post(channel_user_url, headers=headers, json=channel_user_data, timeout=30)
             
-            if response.status_code == 201:
-                result = response.json()
-                logger.info(f"✅ Created Channel_User__c: {result['id']}")
-                return result['id']
-            else:
+            if response.status_code != 201:
                 logger.error(f"❌ Failed to create Channel_User__c: {response.status_code} - {response.text}")
                 return None
+            
+            channel_user_result = response.json()
+            channel_user_id = channel_user_result['id']
+            logger.info(f"✅ Created Channel_User__c: {channel_user_id}")
+            
+            # 2. CREATE SUPPORT CONVERSATION (Active state)
+            conversation_url = f"{SF_INSTANCE_URL}/services/data/v58.0/sobjects/Support_Conversation__c/"
+            
+            conversation_data = {
+                'Channel_User_Name__c': channel_user_id,
+                'Status__c': 'Active',
+                'Created_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
+                'Last_Activity_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
+                'Last_Message_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
+            }
+            
+            logger.info(f"📝 Creating Support Conversation for Channel User {channel_user_id}")
+            response = requests.post(conversation_url, headers=headers, json=conversation_data, timeout=30)
+            
+            if response.status_code != 201:
+                logger.error(f"⚠️ Failed to create Support_Conversation__c: {response.status_code} - {response.text}")
+                # Channel user was created, but conversation failed - return channel user ID only
+                return {'channelUserId': channel_user_id, 'conversationId': None}
+            
+            conversation_result = response.json()
+            conversation_id = conversation_result['id']
+            logger.info(f"✅ Created Support_Conversation__c: {conversation_id}")
+            
+            # 3. UPDATE CONTACT WITH TELEGRAM ID (if contact exists)
+            if contact_id:
+                self.update_contact_telegram_id(contact_id, telegram_id)
+            
+            return {
+                'channelUserId': channel_user_id,
+                'conversationId': conversation_id
+            }
                 
         except Exception as e:
-            logger.error(f"❌ Error creating channel user: {e}")
+            logger.error(f"❌ Error creating channel user with conversation: {e}")
             return None
     
     def link_channel_user_to_contact(self, channel_user_id, contact_id):
@@ -383,6 +452,33 @@ class TelegramBotManager:
             logger.error(f"❌ Error updating contact: {e}")
             return False
     
+    def create_new_session(self, conversation_id, chat_id, first_name=None, last_name=None):
+        """Trigger creation of new chat session via webhook"""
+        try:
+            payload = {
+                'channelType': 'Telegram',
+                'chatId': str(chat_id),
+                'message': 'Customer started support session via menu option 1',
+                'messageId': f"TG_SESSION_{int(time.time())}",
+                'firstName': first_name,
+                'lastName': last_name,
+                'isSessionStart': True,
+                'conversationId': conversation_id
+            }
+            
+            success = self.forward_to_salesforce(payload)
+            
+            if success:
+                logger.info(f"✅ Triggered session creation for conversation {conversation_id}")
+                return True
+            else:
+                logger.error(f"❌ Failed to trigger session creation")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Error creating new session: {e}")
+            return False
+    
     def send_typing_action(self, chat_id):
         """Send typing action to Telegram"""
         try:
@@ -413,6 +509,47 @@ class TelegramBotManager:
             cleaned = '0' + cleaned
         return cleaned
 
+    def get_queue_position(self, conversation_id):
+        """Get queue position for a conversation"""
+        try:
+            access_token = self.sf_auth.get_access_token()
+            if not access_token:
+                return None
+            
+            headers = {
+                'Authorization': f'Bearer {access_token}',
+                'Content-Type': 'application/json'
+            }
+            
+            # Get all waiting sessions in queue ordered by creation time
+            query = f"""
+            SELECT Id, CreatedDate 
+            FROM Chat_Session__c 
+            WHERE Owner.Name = 'New Telegram Messages'
+            AND Status__c = 'Waiting'
+            AND Support_Conversation__c = '{conversation_id}'
+            ORDER BY CreatedDate ASC
+            """
+            encoded_query = requests.utils.quote(query)
+            url = f"{SF_INSTANCE_URL}/services/data/v58.0/query?q={encoded_query}"
+            
+            response = requests.get(url, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                records = data.get('records', [])
+                
+                # Find position of our session
+                for i, record in enumerate(records):
+                    if record.get('Id'):  # We would need session ID here
+                        return i + 1  # Position in queue (1-based)
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting queue position: {e}")
+            return None
+
 # Initialize bot manager
 bot_manager = TelegramBotManager()
 
@@ -423,33 +560,56 @@ def is_phone_number(text):
     phone_pattern = r'^(\+?251|0)?[97]\d{8}$'
     return re.match(phone_pattern, text.strip()) is not None
 
-def show_main_menu(chat_id, user_name=None):
+def show_main_menu(chat_id, user_name=None, has_active_session=False):
     """Show main menu with options"""
-    welcome_text = "👋 *Welcome to Bank of Abyssinia Support!*"
-    if user_name:
-        welcome_text = f"👋 *Welcome back, {user_name}!*"
-    
-    menu_text = f"""
+    if has_active_session:
+        menu_text = f"""
+🔔 *You have an active support session*
+
+*Choose an option:*
+
+1️⃣ *Continue Support Session* - Go back to your active support conversation
+2️⃣ *Track your Case* - Check status of existing cases
+3️⃣ *New Support Request* - Start a new support session
+4️⃣ *Main Menu* - See all options
+        """
+    else:
+        welcome_text = "👋 *Welcome to Bank of Abyssinia Support!*"
+        if user_name:
+            welcome_text = f"👋 *Welcome back, {user_name}!*"
+        
+        menu_text = f"""
 {welcome_text}
 
-Please choose an option:
+*Choose an option:*
 
 1️⃣ *Contact Customer Support* - Connect with our support team
-2️⃣ *Track your Case* - Check the status of your existing cases
+2️⃣ *Track your Case* - Check status of existing cases
 
 *Simply type the number (1 or 2) to select an option.*
-"""
+        """
     
     return bot_manager.send_message(chat_id, menu_text, parse_mode='Markdown')
 
-def handle_contact_support(chat_id, channel_user_id, first_name=None, last_name=None):
+def handle_contact_support(chat_id, channel_user_id, conversation_id, first_name=None, last_name=None):
     """Handle Contact Customer Support option"""
     try:
-        # Check for active sessions
-        active_sessions = bot_manager.get_active_sessions_for_user(channel_user_id)
+        # Show typing indicator
+        bot_manager.send_typing_action(chat_id)
+        
+        if not conversation_id:
+            error_text = """
+❌ *Sorry, we couldn't find your conversation.*
+
+Please try again or contact support through other channels.
+            """
+            return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
+        
+        # Check for existing active sessions
+        active_sessions = bot_manager.get_active_sessions(conversation_id)
         
         if active_sessions:
-            # Active session exists - inform user
+            # Active session exists
             session = active_sessions[0]
             session_status = session.get('Status__c', 'Unknown')
             
@@ -457,34 +617,35 @@ def handle_contact_support(chat_id, channel_user_id, first_name=None, last_name=
                 response_text = """
 ✅ *You have an active support session!*
 
-Please describe your issue or question, and our agent will assist you.
+You're currently connected with an agent. Please continue your conversation.
                 """
             else:
+                # Session is waiting in queue
                 response_text = """
-⏳ *Your support request is in the queue.*
+⏳ *Your support request is already in the queue.*
 
-An agent will be with you shortly. Please wait for their response.
+Please wait for an agent to join. You can describe your issue now.
                 """
         else:
-            # No active session - create one via Salesforce webhook
-            response_text = """
-📞 *Connecting you to customer support...*
+            # No active session - create new one
+            success = bot_manager.create_new_session(conversation_id, chat_id, first_name, last_name)
+            
+            if not success:
+                error_text = """
+❌ *Sorry, we couldn't create a support session.*
 
-Please describe your issue or question, and our team will assist you shortly.
+Please try again in a few moments.
+                """
+                return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
+            
+            # Session was created successfully
+            response_text = """
+✅ *Support session created!*
+
+You are now in the queue. An agent will be with you shortly.
+
+Please describe your issue or question when you're ready.
             """
-            
-            # Send a message to Salesforce to trigger session creation
-            payload = {
-                'channelType': 'Telegram',
-                'chatId': str(chat_id),
-                'message': 'Customer selected: Contact Customer Support',
-                'messageId': f"TG_MENU_{int(time.time())}",
-                'firstName': first_name,
-                'lastName': last_name,
-                'isMenuSelection': True
-            }
-            
-            bot_manager.forward_to_salesforce(payload)
         
         return bot_manager.send_message(chat_id, response_text, parse_mode='Markdown')
         
@@ -504,6 +665,35 @@ For now, please contact customer support for case updates.
     """
     return bot_manager.send_message(chat_id, response_text, parse_mode='Markdown')
 
+def handle_continue_session(chat_id, conversation_id):
+    """Handle Continue Support Session option"""
+    active_sessions = bot_manager.get_active_sessions(conversation_id)
+    
+    if not active_sessions:
+        response_text = """
+ℹ️ *You don't have an active support session.*
+
+Please start a new support session using option 1.
+        """
+    else:
+        session = active_sessions[0]
+        session_status = session.get('Status__c', 'Unknown')
+        
+        if session_status == 'Active':
+            response_text = """
+✅ *Returning to your support session...*
+
+You're connected with an agent. Please continue your conversation.
+            """
+        else:
+            response_text = """
+⏳ *Returning to your support request...*
+
+You're still in the queue. An agent will join shortly.
+            """
+    
+    return bot_manager.send_message(chat_id, response_text, parse_mode='Markdown')
+
 def process_incoming_message(chat_id, message_text, user_data):
     """Process incoming Telegram message"""
     try:
@@ -519,8 +709,12 @@ def process_incoming_message(chat_id, message_text, user_data):
         channel_user = bot_manager.check_existing_channel_user(chat_id_str)
         
         if channel_user:
-            # ✅ Channel User EXISTS - Show main menu or process message
+            # ✅ Channel User EXISTS
             logger.info(f"✅ Existing Channel User found: {channel_user['Id']}")
+            
+            # Get conversation for this user
+            conversation = bot_manager.get_active_support_conversation(channel_user['Id'])
+            conversation_id = conversation['Id'] if conversation else None
             
             # Get user info for personalized greeting
             user_name = None
@@ -529,11 +723,19 @@ def process_incoming_message(chat_id, message_text, user_data):
             elif user_data:
                 user_name = user_data.get('first_name')
             
-            # Check menu selection
+            # Check for active sessions
+            active_sessions = []
+            if conversation_id:
+                active_sessions = bot_manager.get_active_sessions(conversation_id)
+            
+            has_active_session = len(active_sessions) > 0
+            
+            # Handle menu selections
             if message_lower in ['1', 'contact', 'support', 'contact support', 'customer support']:
                 return handle_contact_support(
                     chat_id, 
-                    channel_user['Id'], 
+                    channel_user['Id'],
+                    conversation_id,
                     channel_user['Contact__r'].get('FirstName') if channel_user.get('Contact__r') else user_data.get('first_name'),
                     channel_user['Contact__r'].get('LastName') if channel_user.get('Contact__r') else user_data.get('last_name')
                 )
@@ -541,17 +743,46 @@ def process_incoming_message(chat_id, message_text, user_data):
             elif message_lower in ['2', 'track', 'track case', 'case', 'my case']:
                 return handle_track_case(chat_id)
             
+            elif message_lower in ['3', 'new support', 'new session'] and has_active_session:
+                # User wants to start new session while one exists
+                response_text = """
+🔄 *Starting new support session...*
+
+Your previous session will be ended and a new one will be created.
+                """
+                bot_manager.send_message(chat_id, response_text, parse_mode='Markdown')
+                return handle_contact_support(
+                    chat_id, 
+                    channel_user['Id'],
+                    conversation_id,
+                    channel_user['Contact__r'].get('FirstName') if channel_user.get('Contact__r') else user_data.get('first_name'),
+                    channel_user['Contact__r'].get('LastName') if channel_user.get('Contact__r') else user_data.get('last_name')
+                )
+            
+            elif message_lower == '4' and has_active_session:
+                # Show main menu
+                return show_main_menu(chat_id, user_name, has_active_session)
+            
             elif message_lower == '/start':
                 # Show main menu for existing users
-                return show_main_menu(chat_id, user_name)
+                return show_main_menu(chat_id, user_name, has_active_session)
             
-            elif message_lower in ['hi', 'hello', 'hey', 'help']:
-                # Greeting - show menu
-                return show_main_menu(chat_id, user_name)
+            elif message_lower in ['hi', 'hello', 'hey', 'help', 'menu']:
+                # Greeting - show appropriate menu
+                return show_main_menu(chat_id, user_name, has_active_session)
+            
+            elif has_active_session and message_lower == '1':
+                # Continue active session
+                return handle_continue_session(chat_id, conversation_id)
             
             else:
                 # Regular message - forward to Salesforce
                 logger.info(f"📤 Forwarding message to Salesforce from user {chat_id}")
+                
+                # Determine if this should go to active session
+                session_id = None
+                if active_sessions:
+                    session_id = active_sessions[0]['Id']
                 
                 # Create payload for Salesforce webhook
                 payload = {
@@ -565,6 +796,14 @@ def process_incoming_message(chat_id, message_text, user_data):
                     'languageCode': user_data.get('language_code', 'en')
                 }
                 
+                # Add conversation and session info if available
+                if conversation_id:
+                    payload['conversationId'] = conversation_id
+                
+                if session_id:
+                    payload['sessionId'] = session_id
+                    payload['hasActiveSession'] = True
+                
                 # Add contact info if available
                 if channel_user.get('Contact__r'):
                     payload['contactId'] = channel_user['Contact__r'].get('Id')
@@ -573,8 +812,11 @@ def process_incoming_message(chat_id, message_text, user_data):
                 success = bot_manager.forward_to_salesforce(payload)
                 
                 if success:
-                    # Send confirmation for support-related messages
-                    if len(message_text) > 3 and message_lower not in ['ok', 'thanks', 'thank you']:
+                    # Only send confirmation for non-menu, non-session messages
+                    if (len(message_text) > 3 and 
+                        message_lower not in ['ok', 'thanks', 'thank you', '1', '2', '3', '4'] and
+                        not has_active_session):
+                        
                         bot_manager.send_message(
                             chat_id,
                             "✅ *Message received.*\n\nOur support team will respond shortly.",
@@ -605,61 +847,48 @@ Example: *0912121212*
                 return
             
             elif is_phone_number(message_text):
-                # User provided phone number - create Channel User
+                # User provided phone number - create Channel User AND Conversation
                 clean_phone = bot_manager.clean_phone_number(message_text)
                 
-                logger.info(f"📱 Creating Channel User for {chat_id} with phone: {clean_phone}")
+                logger.info(f"📱 Creating Channel User and Conversation for {chat_id} with phone: {clean_phone}")
                 
-                # First, create Channel_User__c (WITHOUT contact link initially)
-                channel_user_id = bot_manager.create_channel_user(
+                # Check if Contact exists with this phone
+                contact = bot_manager.find_contact_by_phone(clean_phone)
+                
+                contact_id = contact['Id'] if contact else None
+                
+                # Create Channel User AND Support Conversation together
+                result = bot_manager.create_channel_user_with_conversation(
                     telegram_id=chat_id_str,
-                    phone=clean_phone
+                    phone=clean_phone,
+                    contact_id=contact_id,
+                    first_name=user_data.get('first_name'),
+                    last_name=user_data.get('last_name')
                 )
                 
-                if not channel_user_id:
+                if not result:
                     error_text = "❌ *Sorry, there was an error creating your account. Please try again.*"
                     return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
                 
-                # Now check if Contact exists with this phone
-                contact = bot_manager.find_contact_by_phone(clean_phone)
-                
+                # Show welcome message
                 if contact:
-                    # ✅ Contact exists - link it to Channel User
-                    logger.info(f"✅ Found existing Contact: {contact['Id']}")
-                    
-                    # Link Channel User to Contact
-                    if bot_manager.link_channel_user_to_contact(channel_user_id, contact['Id']):
-                        # Update Contact with Telegram ID
-                        bot_manager.update_contact_telegram_id(contact['Id'], chat_id_str)
-                        
-                        # Show personalized welcome
-                        contact_name = contact.get('FirstName', 'Customer')
-                        welcome_text = f"""
+                    contact_name = contact.get('FirstName', 'Customer')
+                    welcome_text = f"""
 ✅ *Welcome back, {contact_name}!*
 
-You're now connected to our support system.
-                        """
-                        bot_manager.send_message(chat_id, welcome_text, parse_mode='Markdown')
-                        
-                        # Show main menu
-                        return show_main_menu(chat_id, contact_name)
-                    else:
-                        # Link failed, but Channel User was created - continue with basic account
-                        logger.warning(f"⚠️ Failed to link Contact, but Channel User created: {channel_user_id}")
+You're now registered in our support system.
+                    """
                 else:
-                    # ❌ No Contact found - that's OK, Channel User exists without Contact
-                    logger.info(f"⚠️ No Contact found for phone {clean_phone}, Channel User created without Contact link")
-                
-                # Show generic welcome (Channel User created, with or without Contact)
-                welcome_text = """
+                    welcome_text = """
 ✅ *Registration Successful!*
 
 You're now connected to our support system.
-                """
+                    """
+                
                 bot_manager.send_message(chat_id, welcome_text, parse_mode='Markdown')
                 
                 # Show main menu
-                return show_main_menu(chat_id)
+                return show_main_menu(chat_id, contact.get('FirstName') if contact else None)
             
             else:
                 # User didn't provide phone number
@@ -688,7 +917,7 @@ Or type */start* to see the welcome message.
             parse_mode='Markdown'
         )
 
-# Flask routes (same as before)
+# Flask routes
 @app.route('/api/send-to-user', methods=['POST'])
 def send_to_user():
     """Endpoint for Salesforce to send messages to Telegram"""
@@ -779,18 +1008,89 @@ def set_webhook():
         logger.error(f"❌ Set webhook error: {e}")
         return jsonify({'error': str(e)}), 500
 
-# Test endpoint
+# Test endpoints
+@app.route('/test-registration/<phone>', methods=['GET'])
+def test_registration(phone):
+    """Test registration endpoint"""
+    try:
+        # Simulate a user registration
+        chat_id = "123456789"  # Test chat ID
+        clean_phone = bot_manager.clean_phone_number(phone)
+        
+        # Create Channel User and Conversation
+        result = bot_manager.create_channel_user_with_conversation(
+            telegram_id=chat_id,
+            phone=clean_phone,
+            first_name="Test",
+            last_name="User"
+        )
+        
+        if result:
+            return jsonify({
+                'status': 'success',
+                'message': 'Test registration complete',
+                'result': result
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': 'Registration failed'
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"❌ Test registration error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/test-conversation/<telegram_id>', methods=['GET'])
+def test_conversation(telegram_id):
+    """Test conversation endpoint"""
+    try:
+        # Find channel user
+        channel_user = bot_manager.check_existing_channel_user(telegram_id)
+        
+        if not channel_user:
+            return jsonify({'error': 'Channel user not found'}), 404
+        
+        # Get conversation
+        conversation = bot_manager.get_active_support_conversation(channel_user['Id'])
+        
+        if conversation:
+            return jsonify({
+                'status': 'success',
+                'message': 'Conversation found',
+                'channel_user': {
+                    'id': channel_user['Id'],
+                    'name': channel_user.get('Name')
+                },
+                'conversation': {
+                    'id': conversation['Id'],
+                    'status': conversation.get('Status__c')
+                }
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': 'No active conversation found'
+            }), 404
+            
+    except Exception as e:
+        logger.error(f"❌ Test conversation error: {e}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/test', methods=['GET'])
 def test():
     return jsonify({
         'status': 'online',
         'service': 'Telegram Bot Integration',
-        'version': '3.0',
-        'workflow': '1. Check Channel User → 2. Create if needed → 3. Link Contact if exists → 4. Main Menu',
+        'version': '4.0',
+        'architecture': 'Channel User → Support Conversation → Chat Sessions',
+        'workflow': '1. Create Channel User & Conversation → 2. Menu Options → 3. Session Creation',
         'endpoints': {
             'webhook': 'POST /webhook',
             'send_to_user': 'POST /api/send-to-user',
             'set_webhook': 'GET /set-webhook',
+            'test_registration': 'GET /test-registration/<phone>',
+            'test_conversation': 'GET /test-conversation/<telegram_id>',
             'health': 'GET /health'
         }
     })
@@ -800,12 +1100,15 @@ def test():
 def health_check():
     try:
         access_token = bot_manager.sf_auth.get_access_token()
+        
         return jsonify({
             'status': 'healthy' if BOT_TOKEN and access_token else 'unhealthy',
             'service': 'telegram-salesforce-bot',
+            'version': '4.0',
+            'architecture': 'Channel User → Support Conversation → Chat Sessions',
             'telegram_bot': '✅ Set' if BOT_TOKEN else '❌ Missing',
             'salesforce_connection': '✅ Connected' if access_token else '❌ Failed',
-            'workflow': 'Channel User First → Contact Linking Optional',
+            'workflow': 'Persistent Conversation Model',
             'timestamp': time.time()
         })
     except:
@@ -818,13 +1121,14 @@ def health_check():
 def home():
     return jsonify({
         'message': 'Telegram Bot for Salesforce Integration',
-        'workflow': '1. Check/Create Channel User → 2. Link Contact if exists → 3. Main Menu → 4. Support Queue',
+        'architecture': 'Channel User → Support Conversation → Chat Sessions',
+        'version': '4.0',
         'status': 'Running'
     })
 
 if __name__ == '__main__':
     logger.info("=" * 50)
-    logger.info("🚀 Starting Telegram Bot v3.0 (Channel User First Workflow)")
+    logger.info("🚀 Starting Telegram Bot v4.0 (Persistent Conversation Model)")
     logger.info("=" * 50)
     
     if missing_vars:
@@ -833,7 +1137,8 @@ if __name__ == '__main__':
         logger.info("✅ All environment variables are set")
     
     logger.info("📱 Channel Type: Telegram")
-    logger.info("👤 Workflow: Channel User First → Contact Optional → Menu → Support")
-    logger.info("🔗 Contact Linking: Optional (only if Contact exists)")
+    logger.info("👤 Architecture: Channel User → Support Conversation → Chat Sessions")
+    logger.info("🔄 Conversation: Persistent (Active state)")
+    logger.info("💬 Sessions: Temporary (per support request)")
     logger.info(f"🌐 Starting server on port {PORT}")
     app.run(host='0.0.0.0', port=PORT, debug=False)
