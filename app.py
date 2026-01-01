@@ -695,7 +695,7 @@ You're still in the queue. An agent will join shortly.
     return bot_manager.send_message(chat_id, response_text, parse_mode='Markdown')
 
 def process_incoming_message(chat_id, message_text, user_data):
-    """Process incoming Telegram message"""
+    """Process incoming Telegram message with consistent session handling"""
     try:
         # Show typing indicator
         bot_manager.send_typing_action(chat_id)
@@ -708,206 +708,98 @@ def process_incoming_message(chat_id, message_text, user_data):
         # STEP 1: Check if Channel_User__c exists
         channel_user = bot_manager.check_existing_channel_user(chat_id_str)
         
-        if channel_user:
-            # ✅ Channel User EXISTS
-            logger.info(f"✅ Existing Channel User found: {channel_user['Id']}")
+        if not channel_user:
+            # Handle registration flow (keep existing registration logic)
+            return handle_new_user_registration(chat_id, message_text, user_data)
+        
+        # ✅ Channel User EXISTS
+        logger.info(f"✅ Existing Channel User found: {channel_user['Id']}")
+        
+        # Get conversation for this user
+        conversation = bot_manager.get_active_support_conversation(channel_user['Id'])
+        if not conversation:
+            logger.error(f"❌ No active conversation found for channel user {channel_user['Id']}")
+            error_text = "❌ Sorry, we couldn't find your conversation. Please start a new session with option 1."
+            return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
+        
+        conversation_id = conversation['Id']
+        
+        # Check for active sessions FIRST - this is the key change
+        active_sessions = bot_manager.get_active_sessions(conversation_id)
+        has_active_session = len(active_sessions) > 0
+        
+        # Handle menu selections
+        if message_lower in ['1', 'contact', 'support', 'contact support', 'customer support']:
+            return handle_contact_support(
+                chat_id, 
+                channel_user['Id'],
+                conversation_id,
+                channel_user['Contact__r'].get('FirstName') if channel_user.get('Contact__r') else user_data.get('first_name'),
+                channel_user['Contact__r'].get('LastName') if channel_user.get('Contact__r') else user_data.get('last_name')
+            )
+        
+        elif message_lower in ['2', 'track', 'track case', 'case', 'my case']:
+            return handle_track_case(chat_id)
+        
+        elif message_lower == '/start':
+            # Show appropriate menu based on active session status
+            user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
+            return show_main_menu(chat_id, user_name, has_active_session)
+        
+        elif message_lower in ['hi', 'hello', 'hey', 'help', 'menu']:
+            # Show appropriate menu based on active session status
+            user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
+            return show_main_menu(chat_id, user_name, has_active_session)
+        
+        # REGULAR MESSAGE HANDLING - ALWAYS CHECK FOR ACTIVE SESSION FIRST
+        elif has_active_session:
+            # If active session exists, forward message to it immediately
+            logger.info(f"📤 Forwarding message to active session from user {chat_id}")
             
-            # Get conversation for this user
-            conversation = bot_manager.get_active_support_conversation(channel_user['Id'])
-            conversation_id = conversation['Id'] if conversation else None
+            payload = {
+                'channelType': 'Telegram',
+                'chatId': chat_id_str,
+                'message': message_text,
+                'messageId': f"TG_{int(time.time())}",
+                'firstName': user_data.get('first_name', ''),
+                'lastName': user_data.get('last_name', ''),
+                'username': user_data.get('username', ''),
+                'languageCode': user_data.get('language_code', 'en'),
+                'conversationId': conversation_id,
+                'isSessionStart': False  # Regular message
+            }
             
-            # Get user info for personalized greeting
-            user_name = None
-            if channel_user.get('Contact__r'):
-                user_name = channel_user['Contact__r'].get('FirstName')
-            elif user_data:
-                user_name = user_data.get('first_name')
+            success = bot_manager.forward_to_salesforce(payload)
             
-            # Check for active sessions
-            active_sessions = []
-            if conversation_id:
-                active_sessions = bot_manager.get_active_sessions(conversation_id)
-            
-            has_active_session = len(active_sessions) > 0
-            
-            # Handle menu selections
-            if message_lower in ['1', 'contact', 'support', 'contact support', 'customer support']:
-                return handle_contact_support(
-                    chat_id, 
-                    channel_user['Id'],
-                    conversation_id,
-                    channel_user['Contact__r'].get('FirstName') if channel_user.get('Contact__r') else user_data.get('first_name'),
-                    channel_user['Contact__r'].get('LastName') if channel_user.get('Contact__r') else user_data.get('last_name')
-                )
-            
-            elif message_lower in ['2', 'track', 'track case', 'case', 'my case']:
-                return handle_track_case(chat_id)
-            
-            elif message_lower in ['3', 'new support', 'new session'] and has_active_session:
-                # User wants to start new session while one exists
-                response_text = """
-🔄 *Starting new support session...*
-
-Your previous session will be ended and a new one will be created.
-                """
-                bot_manager.send_message(chat_id, response_text, parse_mode='Markdown')
-                return handle_contact_support(
-                    chat_id, 
-                    channel_user['Id'],
-                    conversation_id,
-                    channel_user['Contact__r'].get('FirstName') if channel_user.get('Contact__r') else user_data.get('first_name'),
-                    channel_user['Contact__r'].get('LastName') if channel_user.get('Contact__r') else user_data.get('last_name')
-                )
-            
-            elif message_lower == '4' and has_active_session:
-                # Show main menu
-                return show_main_menu(chat_id, user_name, has_active_session)
-            
-            elif message_lower == '/start':
-                # Show main menu for existing users
-                return show_main_menu(chat_id, user_name, has_active_session)
-            
-            elif message_lower in ['hi', 'hello', 'hey', 'help', 'menu']:
-                # Greeting - show appropriate menu
-                return show_main_menu(chat_id, user_name, has_active_session)
-            
-            elif has_active_session and message_lower == '1':
-                # Continue active session
-                return handle_continue_session(chat_id, conversation_id)
-            
+            if success:
+                # No confirmation needed for messages in active sessions
+                pass
             else:
-                # Regular message - forward to Salesforce
-                logger.info(f"📤 Forwarding message to Salesforce from user {chat_id}")
-                
-                # Determine if this should go to active session
-                session_id = None
-                if active_sessions:
-                    session_id = active_sessions[0]['Id']
-                
-                # Create payload for Salesforce webhook
-                payload = {
-                    'channelType': 'Telegram',
-                    'chatId': chat_id_str,
-                    'message': message_text,
-                    'messageId': f"TG_{int(time.time())}",
-                    'firstName': user_data.get('first_name', ''),
-                    'lastName': user_data.get('last_name', ''),
-                    'username': user_data.get('username', ''),
-                    'languageCode': user_data.get('language_code', 'en')
-                }
-                
-                # Add conversation and session info if available
-                if conversation_id:
-                    payload['conversationId'] = conversation_id
-                
-                if session_id:
-                    payload['sessionId'] = session_id
-                    payload['hasActiveSession'] = True
-                
-                # Add contact info if available
-                if channel_user.get('Contact__r'):
-                    payload['contactId'] = channel_user['Contact__r'].get('Id')
-                
-                # Forward to Salesforce
-                success = bot_manager.forward_to_salesforce(payload)
-                
-                if success:
-                    # Only send confirmation for non-menu, non-session messages
-                    if (len(message_text) > 3 and 
-                        message_lower not in ['ok', 'thanks', 'thank you', '1', '2', '3', '4'] and
-                        not has_active_session):
-                        
-                        bot_manager.send_message(
-                            chat_id,
-                            "✅ *Message received.*\n\nOur support team will respond shortly.",
-                            parse_mode='Markdown'
-                        )
-                else:
-                    bot_manager.send_message(
-                        chat_id,
-                        "❌ *Sorry, there was an error processing your message. Please try again.*",
-                        parse_mode='Markdown'
-                    )
+                bot_manager.send_message(
+                    chat_id,
+                    "❌ *Sorry, there was an error sending your message. Please try again.*",
+                    parse_mode='Markdown'
+                )
         
         else:
-            # ❌ Channel User DOES NOT EXIST - Start registration
-            logger.info(f"❌ No Channel User found for {chat_id}")
+            # NO ACTIVE SESSION - Show menu
+            logger.info(f"ℹ️ No active session for user {chat_id}, showing menu")
+            user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
             
-            if message_lower == '/start':
-                welcome_text = """
-👋 *Welcome to Bank of Abyssinia Support!*
+            response_text = f"""
+ℹ️ *Hello {user_name if user_name else 'there'}!*
 
-To get started with our support services, we need to register you in our system.
+You don't have an active support session. 
 
-Please share your *phone number* to begin:
+*Please choose an option:*
 
-Example: *0912121212*
-                """
-                bot_manager.send_message(chat_id, welcome_text, parse_mode='Markdown')
-                return
+1️⃣ *Contact Customer Support* - Start a new support session
+2️⃣ *Track your Case* - Check status of existing cases
+
+Type *1* or *2* to select an option.
+            """
             
-            elif is_phone_number(message_text):
-                # User provided phone number - create Channel User AND Conversation
-                clean_phone = bot_manager.clean_phone_number(message_text)
-                
-                logger.info(f"📱 Creating Channel User and Conversation for {chat_id} with phone: {clean_phone}")
-                
-                # Check if Contact exists with this phone
-                contact = bot_manager.find_contact_by_phone(clean_phone)
-                
-                contact_id = contact['Id'] if contact else None
-                
-                # Create Channel User AND Support Conversation together
-                result = bot_manager.create_channel_user_with_conversation(
-                    telegram_id=chat_id_str,
-                    phone=clean_phone,
-                    contact_id=contact_id,
-                    first_name=user_data.get('first_name'),
-                    last_name=user_data.get('last_name')
-                )
-                
-                if not result:
-                    error_text = "❌ *Sorry, there was an error creating your account. Please try again.*"
-                    return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
-                
-                # Show welcome message
-                if contact:
-                    contact_name = contact.get('FirstName', 'Customer')
-                    welcome_text = f"""
-✅ *Welcome back, {contact_name}!*
-
-You're now registered in our support system.
-                    """
-                else:
-                    welcome_text = """
-✅ *Registration Successful!*
-
-You're now connected to our support system.
-                    """
-                
-                bot_manager.send_message(chat_id, welcome_text, parse_mode='Markdown')
-                
-                # Show main menu
-                return show_main_menu(chat_id, contact.get('FirstName') if contact else None)
-            
-            else:
-                # User didn't provide phone number
-                if chat_id_str in user_registration_state:
-                    # Already in registration flow
-                    error_text = "📱 *Please enter a valid phone number:*\n\nExample: *0912121212*"
-                else:
-                    # First message wasn't /start or phone
-                    error_text = """
-👋 *Welcome to Bank of Abyssinia Support!*
-
-To begin, please share your *phone number*:
-
-Example: *0912121212*
-
-Or type */start* to see the welcome message.
-                    """
-                
-                return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
+            return bot_manager.send_message(chat_id, response_text, parse_mode='Markdown')
                     
     except Exception as e:
         logger.error(f"❌ Error processing message: {e}")
@@ -916,6 +808,77 @@ Or type */start* to see the welcome message.
             "❌ *Sorry, an error occurred. Please try again.*",
             parse_mode='Markdown'
         )
+
+def handle_new_user_registration(chat_id, message_text, user_data):
+    """Handle new user registration (separated for clarity)"""
+    chat_id_str = str(chat_id)
+    message_lower = message_text.strip().lower()
+    
+    if message_lower == '/start':
+        welcome_text = """
+👋 *Welcome to Bank of Abyssinia Support!*
+
+To get started with our support services, we need to register you in our system.
+
+Please share your *phone number* to begin:
+
+Example: *0912121212*
+        """
+        bot_manager.send_message(chat_id, welcome_text, parse_mode='Markdown')
+        return True
+    
+    elif is_phone_number(message_text):
+        clean_phone = bot_manager.clean_phone_number(message_text)
+        
+        logger.info(f"📱 Creating Channel User and Conversation for {chat_id} with phone: {clean_phone}")
+        
+        # Check if Contact exists with this phone
+        contact = bot_manager.find_contact_by_phone(clean_phone)
+        contact_id = contact['Id'] if contact else None
+        
+        # Create Channel User AND Support Conversation together
+        result = bot_manager.create_channel_user_with_conversation(
+            telegram_id=chat_id_str,
+            phone=clean_phone,
+            contact_id=contact_id,
+            first_name=user_data.get('first_name'),
+            last_name=user_data.get('last_name')
+        )
+        
+        if not result:
+            error_text = "❌ *Sorry, there was an error creating your account. Please try again.*"
+            return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
+        
+        # Show welcome message
+        if contact:
+            contact_name = contact.get('FirstName', 'Customer')
+            welcome_text = f"""
+✅ *Welcome back, {contact_name}!*
+
+You're now registered in our support system.
+            """
+        else:
+            welcome_text = """
+✅ *Registration Successful!*
+
+You're now connected to our support system.
+            """
+        
+        bot_manager.send_message(chat_id, welcome_text, parse_mode='Markdown')
+        
+        # Show main menu (no active session for new users)
+        return show_main_menu(chat_id, contact.get('FirstName') if contact else None, has_active_session=False)
+    
+    else:
+        # User didn't provide phone number
+        error_text = """
+📱 *Please enter a valid phone number:*
+
+Example: *0912121212*
+
+Or type */start* to see the welcome message.
+        """
+        return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
 
 # Flask routes
 @app.route('/api/send-to-user', methods=['POST'])
