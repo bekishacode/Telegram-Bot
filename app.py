@@ -458,7 +458,6 @@ class TelegramBotManager:
             payload = {
                 'channelType': 'Telegram',
                 'chatId': str(chat_id),
-                'message': 'Customer started support session',
                 'messageId': f"TG_SESSION_{int(time.time())}",
                 'firstName': first_name,
                 'lastName': last_name,
