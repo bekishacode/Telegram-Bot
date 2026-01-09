@@ -7,6 +7,7 @@ import json
 import uuid
 from datetime import datetime
 from collections import OrderedDict
+from urllib.parse import urlparse
 from flask import Flask, request, jsonify, g
 
 # ============================================
@@ -2071,6 +2072,7 @@ def send_bulk_promotion():
             logger.warning(f"Bulk promotion truncated to {MAX_BULK_RECIPIENTS} recipients")
         
         # Validate attachment URL if provided
+            # Validate attachment URL
         if attachment_url:
             is_valid, error_msg = validate_attachment_url(attachment_url)
             if not is_valid:
