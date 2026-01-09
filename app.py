@@ -1956,45 +1956,82 @@ def build_inline_keyboard(buttons):
 #////////////////////////////////////////////////////////
 # VALIDATE AND SEND BULK PROMOTIONS TO MULTIPLE USERS
 def validate_attachment_url(url):
-    """Validate attachment URL for security - updated version"""
+    """Production-ready URL validation"""
     if not url:
         return False, "No URL provided"
     
-    # Check URL format
-    if not is_valid_url(url):
-        return False, "Invalid URL format"
+    # Basic URL structure
+    if not url.startswith(('http://', 'https://')):
+        return False, "URL must start with http:// or https://"
     
-    # Check allowed domains (if configured)
-    if ALLOWED_ATTACHMENT_DOMAINS and ALLOWED_ATTACHMENT_DOMAINS[0]:
-        parsed_url = urlparse(url)
-        hostname = parsed_url.netloc.lower()
+    try:
+        parsed = urlparse(url)
         
-        # Check if hostname ends with any allowed domain
-        allowed = False
-        for domain in ALLOWED_ATTACHMENT_DOMAINS:
-            domain_clean = domain.strip().lower()
-            if domain_clean and (hostname == domain_clean or hostname.endswith('.' + domain_clean)):
-                allowed = True
-                break
+        # Must have scheme and netloc
+        if not parsed.scheme or not parsed.netloc:
+            return False, "Invalid URL format"
         
-        if not allowed:
-            logger.warning(f"Domain not in allowed list: {hostname}")
-            # For now, let's log but allow it for testing
-            # return False, f"Domain not allowed: {hostname}"
+        # Block dangerous URLs
+        blocked_patterns = [
+            'localhost', '127.0.0.1', '169.254.', '10.', '192.168.',
+            '::1', '0.0.0.0', '[::]', 'internal.', 'private.',
+            'metadata.google.internal', '169.254.169.254'
+        ]
+        
+        for pattern in blocked_patterns:
+            if pattern in parsed.netloc:
+                return False, f"Blocked URL pattern: {pattern}"
+        
+        # Domain whitelist (if configured)
+        if ALLOWED_ATTACHMENT_DOMAINS:
+            allowed = False
+            for allowed_domain in ALLOWED_ATTACHMENT_DOMAINS:
+                if allowed_domain and parsed.netloc.endswith(allowed_domain.strip()):
+                    allowed = True
+                    break
+            
+            if not allowed:
+                # For Marketing Cloud, we need to handle subdomains properly
+                # Check if any allowed domain is a suffix of the hostname
+                hostname = parsed.netloc
+                for allowed_domain in ALLOWED_ATTACHMENT_DOMAINS:
+                    if allowed_domain and hostname.endswith('.' + allowed_domain.strip()):
+                        allowed = True
+                        break
+                
+                if not allowed:
+                    return False, f"Domain not allowed: {parsed.netloc}"
+        
+        # File type validation
+        valid_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
+        if not any(parsed.path.lower().endswith(ext) for ext in valid_extensions):
+            return False, "Only image files allowed (jpg, png, gif, webp)"
+        
+        # Size check (by content-length header, not by URL)
+        # We'll check this separately when downloading
+        
+        return True, "Valid"
+        
+    except Exception as e:
+        logger.error(f"URL validation error: {e}")
+        return False, "URL validation failed"
     
-    # Check file type (Telegram supports: jpg, png, gif, webp)
-    valid_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']
-    url_lower = url.lower()
-    
-    # Check if URL has a valid extension or ends with common image patterns
-    if not any(url_lower.endswith(ext) for ext in valid_extensions):
-        # Also check for URLs without extension but with image patterns
-        if '.png' not in url_lower and '.jpg' not in url_lower and '.jpeg' not in url_lower:
-            logger.warning(f"URL doesn't look like an image: {url}")
-            # For testing, we'll allow it anyway
-            # return False, "Invalid file type. Only images allowed"
-    
-    return True, "Valid"
+def check_attachment_size(url):
+    """Check attachment size before sending"""
+    try:
+        head_response = requests.head(url, timeout=5, allow_redirects=True)
+        content_length = head_response.headers.get('content-length')
+        
+        if content_length:
+            size_mb = int(content_length) / (1024 * 1024)
+            if size_mb > MAX_ATTACHMENT_SIZE_MB:
+                return False, f"File too large: {size_mb:.1f}MB (max: {MAX_ATTACHMENT_SIZE_MB}MB)"
+        
+        return True, "Size OK"
+    except:
+        # If HEAD fails, we'll try anyway but log it
+        logger.warning(f"Could not check size for: {url}")
+        return True, "Size check skipped"
 
 #///SEND TO MASS USERS AT ONCE ENDPOINT
 @app.route('/api/send-bulk-promotion', methods=['POST'])
@@ -2035,13 +2072,22 @@ def send_bulk_promotion():
         
         # Validate attachment URL if provided
         if attachment_url:
-        # Basic URL check
-            if not (attachment_url.startswith('http://') or attachment_url.startswith('https://')):
-                logger.warning(f"Invalid attachment URL (no http/https): {attachment_url}")
-                attachment_url = None
-            else:
-                # For now, just log the URL for debugging
-                logger.info(f"Attachment URL provided: {attachment_url}")
+            is_valid, error_msg = validate_attachment_url(attachment_url)
+            if not is_valid:
+                logger.warning(f"Invalid attachment URL: {error_msg}")
+                # Return error instead of silently removing
+                return jsonify({
+                    'status': 'error',
+                    'error': f'Invalid attachment URL: {error_msg}'
+                }), 400
+            
+            # Check size
+            size_ok, size_msg = check_attachment_size(attachment_url)
+            if not size_ok:
+                return jsonify({
+                    'status': 'error',
+                    'error': size_msg
+                }), 400
         
         # Sanitize message
         safe_message = sanitize_input(message, max_length=1024)  # Shorter limit for promotions
