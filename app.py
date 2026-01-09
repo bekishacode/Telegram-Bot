@@ -1832,6 +1832,293 @@ def send_to_user():
     except Exception as e:
         logger.error(f"Send error: {str(e)[:100]}")
         return jsonify({'error': 'Internal server error'}), 500
+    
+#//HELPER FUNCTIONS FOR BULK PROMOTIONS
+def is_valid_url(url):
+    """Validate URL format"""
+    if not url:
+        return False
+    
+    try:
+        result = urlparse(url)
+        return all([result.scheme, result.netloc])
+    except:
+        return False
+
+def send_promotion_photo(chat_id, photo_url, caption=None, buttons=None):
+    """Send photo promotion with caption and buttons"""
+    try:
+        if not BOT_TOKEN:
+            logger.error("BOT_TOKEN not configured")
+            return False
+        
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+        data = {
+            'chat_id': chat_id,
+            'photo': photo_url,
+            'parse_mode': 'HTML'
+        }
+        
+        if caption:
+            safe_caption = sanitize_input(caption, max_length=1024)  # Telegram photo caption limit
+            data['caption'] = safe_caption
+        
+        if buttons:
+            keyboard = build_inline_keyboard(buttons)
+            if keyboard:
+                data['reply_markup'] = json.dumps({'inline_keyboard': keyboard})
+        
+        response = requests.post(url, data=data, timeout=30)
+        result = response.json()
+        
+        if result.get('ok'):
+            logger.debug(f"Photo promotion sent to {chat_id}")
+            return True
+        else:
+            logger.error(f"Failed to send photo to {chat_id}: {result.get('description')}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error sending photo promotion: {e}")
+        return False
+
+def send_promotion_text(chat_id, text, buttons=None):
+    """Send text promotion with optional buttons"""
+    try:
+        if not BOT_TOKEN:
+            logger.error("BOT_TOKEN not configured")
+            return False
+        
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        data = {
+            'chat_id': chat_id,
+            'text': text,
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': False  # Allow link previews for promotions
+        }
+        
+        if buttons:
+            keyboard = build_inline_keyboard(buttons)
+            if keyboard:
+                data['reply_markup'] = json.dumps({'inline_keyboard': keyboard})
+        
+        response = requests.post(url, data=data, timeout=30)
+        result = response.json()
+        
+        if result.get('ok'):
+            logger.debug(f"Text promotion sent to {chat_id}")
+            return True
+        else:
+            logger.error(f"Failed to send text to {chat_id}: {result.get('description')}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error sending text promotion: {e}")
+        return False
+
+def build_inline_keyboard(buttons):
+    """Build inline keyboard from button configuration"""
+    if not buttons or not isinstance(buttons, list):
+        return []
+    
+    keyboard = []
+    for button_row in buttons:
+        if not isinstance(button_row, list):
+            continue
+        
+        row = []
+        for button in button_row:
+            if isinstance(button, dict):
+                # Format 1: {"text": "Button", "url": "https://..."}
+                if 'text' in button and 'url' in button:
+                    row.append({
+                        'text': str(button['text']),
+                        'url': str(button['url'])
+                    })
+                # Format 2: {"text": "Button", "callback_data": "data"}
+                elif 'text' in button and 'callback_data' in button:
+                    row.append({
+                        'text': str(button['text']),
+                        'callback_data': str(button['callback_data'])
+                    })
+            elif isinstance(button, list) and len(button) >= 2:
+                # Format 3: ["Button Text", "https://url.com"]
+                row.append({
+                    'text': str(button[0]),
+                    'url': str(button[1])
+                })
+        
+        if row:
+            keyboard.append(row)
+    
+    return keyboard
+#////////////////////////////////////////////////////////
+# VALIDATE AND SEND BULK PROMOTIONS TO MULTIPLE USERS
+def validate_attachment_url(url):
+    """Validate attachment URL for security"""
+    if not url:
+        return False, "No URL provided"
+    
+    # Check URL format
+    if not is_valid_url(url):
+        return False, "Invalid URL format"
+    
+    # Check allowed domains
+    if ALLOWED_ATTACHMENT_DOMAINS and ALLOWED_ATTACHMENT_DOMAINS[0]:
+        parsed_url = urlparse(url)
+        allowed = False
+        for domain in ALLOWED_ATTACHMENT_DOMAINS:
+            if parsed_url.netloc.endswith(domain.strip()):
+                allowed = True
+                break
+        if not allowed:
+            return False, f"Domain not allowed: {parsed_url.netloc}"
+    
+    # Check file type (Telegram supports: jpg, png, gif, mp4, etc.)
+    valid_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
+    url_lower = url.lower()
+    if not any(url_lower.endswith(ext) for ext in valid_extensions):
+        return False, "Invalid file type. Only images allowed"
+    
+    return True, "Valid"
+
+#///SEND TO MASS USERS AT ONCE ENDPOINT
+@app.route('/api/send-bulk-promotion', methods=['POST'])
+def send_bulk_promotion():
+    """Dedicated endpoint for sending bulk promotions with attachments"""
+    try:
+        if not request.is_json:
+            logger.warning("Non-JSON request to /api/send-bulk-promotion")
+            return jsonify({'error': 'Content-Type must be application/json'}), 400
+        
+        data = request.get_json()
+        
+        # Validate required fields
+        required_fields = ['chat_ids', 'message']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'error': f'Missing required field: {field}'}), 400
+        
+        chat_ids = data['chat_ids']
+        message = data['message']
+        campaign_id = data.get('campaign_id', '')
+        message_type = data.get('message_type', 'promotion')
+        attachment_url = data.get('attachment_url')  # Optional image URL
+        buttons = data.get('buttons')  # Optional buttons
+        
+        # Validate inputs
+        if not isinstance(chat_ids, list):
+            return jsonify({'error': 'chat_ids must be a list'}), 400
+        
+        if len(chat_ids) == 0:
+            return jsonify({'error': 'No chat_ids provided'}), 400
+        
+        # Security limits
+        MAX_BULK_RECIPIENTS = int(os.getenv('MAX_BULK_RECIPIENTS', '500'))
+        if len(chat_ids) > MAX_BULK_RECIPIENTS:
+            chat_ids = chat_ids[:MAX_BULK_RECIPIENTS]
+            logger.warning(f"Bulk promotion truncated to {MAX_BULK_RECIPIENTS} recipients")
+        
+        # Validate attachment URL if provided
+        if attachment_url and not is_valid_url(attachment_url):
+            logger.warning(f"Invalid attachment URL: {attachment_url}")
+            attachment_url = None
+        
+        # Sanitize message
+        safe_message = sanitize_input(message, max_length=1024)  # Shorter limit for promotions
+        
+        # Track results
+        results = {
+            'total': len(chat_ids),
+            'successful': 0,
+            'failed': 0,
+            'failed_details': [],
+            'campaign_id': campaign_id,
+            'message_type': message_type,
+            'has_attachment': bool(attachment_url),
+            'has_buttons': bool(buttons)
+        }
+        
+        logger.info(f"Starting bulk promotion to {len(chat_ids)} users, campaign: {campaign_id}")
+        
+        # Send messages with smart rate limiting
+        for i, chat_id in enumerate(chat_ids):
+            try:
+                # Smart rate limiting for bulk sends
+                if i > 0:
+                    # Telegram has limits: 30 messages/second to different chats
+                    if i % 25 == 0:  # Conservative: 25 messages then pause
+                        time.sleep(1)
+                    elif i % 5 == 0:  # Small pause every 5 messages
+                        time.sleep(0.1)
+                
+                # Validate chat_id
+                chat_id_str = str(chat_id)
+                if not chat_id_str.isdigit():
+                    logger.warning(f"Invalid chat ID format: {chat_id}")
+                    results['failed'] += 1
+                    results['failed_details'].append({
+                        'chat_id': chat_id,
+                        'error': 'Invalid chat ID format'
+                    })
+                    continue
+                
+                # Send promotion (with or without attachment)
+                if attachment_url:
+                    # Send photo with caption and buttons
+                    success = send_promotion_photo(
+                        chat_id=chat_id_str,
+                        photo_url=attachment_url,
+                        caption=safe_message,
+                        buttons=buttons
+                    )
+                else:
+                    # Send text message with optional buttons
+                    success = send_promotion_text(
+                        chat_id=chat_id_str,
+                        text=safe_message,
+                        buttons=buttons
+                    )
+                
+                if success:
+                    results['successful'] += 1
+                else:
+                    results['failed'] += 1
+                    results['failed_details'].append({
+                        'chat_id': chat_id,
+                        'error': 'Failed to send promotion'
+                    })
+                
+                # Log progress for large batches
+                if len(chat_ids) > 50 and i % 50 == 0:
+                    logger.info(f"Bulk promotion progress: {i}/{len(chat_ids)} sent")
+                
+            except Exception as e:
+                logger.error(f"Error sending to {chat_id}: {e}")
+                results['failed'] += 1
+                results['failed_details'].append({
+                    'chat_id': chat_id,
+                    'error': str(e)[:100]
+                })
+        
+        logger.info(f"Bulk promotion completed: {results['successful']}/{results['total']} successful")
+        
+        return jsonify({
+            'status': 'success',
+            'action': 'bulk_promotion',
+            'results': results,
+            'summary': {
+                'sent': results['successful'],
+                'failed': results['failed'],
+                'total': results['total'],
+                'success_rate': round((results['successful'] / results['total']) * 100, 2) if results['total'] > 0 else 0
+            }
+        })
+            
+    except Exception as e:
+        logger.error(f"Bulk promotion error: {str(e)[:100]}")
+        return jsonify({'error': 'Internal server error'}), 500
+#//////////////////////////////////////
 
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
