@@ -11,6 +11,13 @@ from urllib.parse import urlparse
 from flask import Flask, request, jsonify, g
 
 # ============================================
+
+# Bulk messaging configuration
+MAX_BULK_RECIPIENTS = int(os.getenv('MAX_BULK_RECIPIENTS', '500'))
+BULK_SEND_DELAY = float(os.getenv('BULK_SEND_DELAY', '0.1'))  # 100ms between messages
+TELEGRAM_RATE_LIMIT = int(os.getenv('TELEGRAM_RATE_LIMIT', '25'))  # Messages per second
+ALLOWED_ATTACHMENT_DOMAINS = os.getenv('ALLOWED_ATTACHMENT_DOMAINS', '').split(',')
+MAX_ATTACHMENT_SIZE_MB = int(os.getenv('MAX_ATTACHMENT_SIZE_MB', '5'))
 # ENHANCED CONFIGURATION WITH SECURITY SETTINGS
 # ============================================
 BOT_TOKEN = os.getenv('BOT_TOKEN')
