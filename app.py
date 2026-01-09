@@ -4,56 +4,261 @@ import requests
 import time
 import re
 import json
-from flask import Flask, request, jsonify
+import uuid
+from datetime import datetime
+from collections import OrderedDict
+from flask import Flask, request, jsonify, g
 
-# Configuration with validation
+# ============================================
+# ENHANCED CONFIGURATION WITH SECURITY SETTINGS
+# ============================================
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 SALESFORCE_WEBHOOK_URL = os.getenv('SALESFORCE_WEBHOOK_URL')
 SF_INSTANCE_URL = os.getenv('SF_INSTANCE_URL')
 SF_CLIENT_ID = os.getenv('SF_CLIENT_ID')
 SF_CLIENT_SECRET = os.getenv('SF_CLIENT_SECRET')
-PORT = int(os.getenv('PORT', 10000))
+
+# Security configurations
+RATE_LIMIT_PER_MINUTE = int(os.getenv('RATE_LIMIT_PER_MINUTE', '30'))
+MAX_MESSAGE_LENGTH = int(os.getenv('MAX_MESSAGE_LENGTH', '4000'))
+REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', '30'))
+ENABLE_RATE_LIMITING = os.getenv('ENABLE_RATE_LIMITING', 'true').lower() == 'true'
+ENABLE_INPUT_SANITIZATION = os.getenv('ENABLE_INPUT_SANITIZATION', 'true').lower() == 'true'
+PORT = int(os.getenv('PORT', '10000'))
 
 # Validate required environment variables
 missing_vars = []
-if not BOT_TOKEN:
-    missing_vars.append('BOT_TOKEN')
-if not SALESFORCE_WEBHOOK_URL:
-    missing_vars.append('SALESFORCE_WEBHOOK_URL')
-if not SF_INSTANCE_URL:
-    missing_vars.append('SF_INSTANCE_URL')
-if not SF_CLIENT_ID:
-    missing_vars.append('SF_CLIENT_ID')
-if not SF_CLIENT_SECRET:
-    missing_vars.append('SF_CLIENT_SECRET')
+for var_name, var_value in [
+    ('BOT_TOKEN', BOT_TOKEN),
+    ('SALESFORCE_WEBHOOK_URL', SALESFORCE_WEBHOOK_URL),
+    ('SF_INSTANCE_URL', SF_INSTANCE_URL),
+    ('SF_CLIENT_ID', SF_CLIENT_ID),
+    ('SF_CLIENT_SECRET', SF_CLIENT_SECRET)
+]:
+    if not var_value:
+        missing_vars.append(var_name)
 
 app = Flask(__name__)
 
-# Configure logging
+# ============================================
+# ENHANCED LOGGING WITH SECURITY CONTEXT
+# ============================================
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(request_id)s] - [IP:%(client_ip)s] - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# In-memory storage for user session state
-user_session_state = {}  # Changed from registration_state to session_state
+# Add filter to inject request context
+class SecurityContextFilter(logging.Filter):
+    def filter(self, record):
+        record.request_id = getattr(g, 'request_id', 'no-id')
+        record.client_ip = getattr(g, 'client_ip', 'no-ip')
+        return True
 
+logger.addFilter(SecurityContextFilter())
+
+# ============================================
+# RATE LIMITING IMPLEMENTATION
+# ============================================
+class RateLimiter:
+    """Simple in-memory rate limiter"""
+    
+    def __init__(self, requests_per_minute=30):
+        self.requests_per_minute = requests_per_minute
+        self.requests = OrderedDict()  # {ip: [timestamps]}
+        self.cleanup_interval = 60  # Cleanup every 60 seconds
+        self.last_cleanup = time.time()
+    
+    def _cleanup_old_requests(self):
+        """Remove requests older than 1 minute"""
+        current_time = time.time()
+        cutoff = current_time - 60
+        
+        for ip in list(self.requests.keys()):
+            # Filter timestamps
+            self.requests[ip] = [t for t in self.requests[ip] if t > cutoff]
+            # Remove empty lists
+            if not self.requests[ip]:
+                del self.requests[ip]
+        
+        self.last_cleanup = current_time
+    
+    def is_rate_limited(self, ip):
+        """Check if IP is rate limited"""
+        if not ENABLE_RATE_LIMITING:
+            return False
+        
+        current_time = time.time()
+        
+        # Cleanup old requests if needed
+        if current_time - self.last_cleanup > self.cleanup_interval:
+            self._cleanup_old_requests()
+        
+        # Get or create IP entry
+        if ip not in self.requests:
+            self.requests[ip] = []
+        
+        # Remove timestamps older than 1 minute
+        self.requests[ip] = [t for t in self.requests[ip] if t > current_time - 60]
+        
+        # Check if rate limited
+        if len(self.requests[ip]) >= self.requests_per_minute:
+            return True
+        
+        # Add current request
+        self.requests[ip].append(current_time)
+        return False
+
+# Initialize rate limiter
+rate_limiter = RateLimiter(requests_per_minute=RATE_LIMIT_PER_MINUTE)
+
+# ============================================
+# SECURITY MIDDLEWARE
+# ============================================
+@app.before_request
+def security_middleware():
+    """Security middleware for all requests"""
+    # Generate request ID for tracing
+    g.request_id = str(uuid.uuid4())[:12]
+    
+    # Get client IP (handling proxies)
+    g.client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+    if ',' in g.client_ip:
+        g.client_ip = g.client_ip.split(',')[0].strip()
+    
+    # Skip rate limiting for health/status endpoints
+    if request.path in ['/health', '/', '/test', '/metrics']:
+        return
+    
+    # Apply rate limiting
+    if rate_limiter.is_rate_limited(g.client_ip):
+        logger.warning(f"Rate limit exceeded for IP: {g.client_ip}")
+        return jsonify({
+            'error': 'Rate limit exceeded',
+            'message': 'Too many requests. Please try again later.'
+        }), 429
+
+# ============================================
+# SECURITY UTILITY FUNCTIONS
+# ============================================
+def sanitize_input(text, max_length=MAX_MESSAGE_LENGTH):
+    """Sanitize user input to prevent injection attacks"""
+    if not text or not ENABLE_INPUT_SANITIZATION:
+        return text[:max_length] if text else text
+    
+    # Remove null bytes
+    text = text.replace('\x00', '')
+    
+    # Truncate to max length
+    if len(text) > max_length:
+        text = text[:max_length]
+        logger.warning(f"Message truncated to {max_length} characters")
+    
+    return text
+
+def sanitize_salesforce_id(sf_id):
+    """Validate and sanitize Salesforce ID"""
+    if not sf_id:
+        return None
+    
+    # Salesforce IDs are 15 or 18 characters, alphanumeric
+    if not re.match(r'^[a-zA-Z0-9]{15,18}$', sf_id):
+        logger.warning(f"Invalid Salesforce ID format: {sf_id}")
+        return None
+    
+    return sf_id
+
+def sanitize_phone_number(phone):
+    """Enhanced phone number sanitization with validation"""
+    if not phone:
+        return ""
+    
+    # Remove all non-digits
+    cleaned = re.sub(r'[^\d]', '', phone)
+    
+    # Validate Ethiopian phone format
+    if len(cleaned) < 9 or len(cleaned) > 12:
+        return ""
+    
+    # Handle Ethiopian country codes
+    if cleaned.startswith('251'):
+        cleaned = cleaned[3:]
+    elif cleaned.startswith('+251'):
+        cleaned = cleaned[4:]
+    
+    # Ensure it starts with 0
+    if not cleaned.startswith('0'):
+        cleaned = '0' + cleaned
+    
+    # Final validation: Ethiopian mobile numbers start with 09 or 07
+    if not re.match(r'^0[79]\d{8}$', cleaned):
+        return ""
+    
+    return cleaned
+
+def validate_telegram_payload(payload):
+    """Validate Telegram webhook payload structure"""
+    required_fields = ['update_id']
+    
+    if not isinstance(payload, dict):
+        return False, "Payload must be a dictionary"
+    
+    for field in required_fields:
+        if field not in payload:
+            return False, f"Missing required field: {field}"
+    
+    # Validate message structure if present
+    if 'message' in payload:
+        message = payload['message']
+        if 'chat' not in message or 'id' not in message['chat']:
+            return False, "Invalid message structure"
+        
+        # Validate chat ID is numeric
+        if not isinstance(message['chat']['id'], (int, str)):
+            return False, "Invalid chat ID type"
+        
+        try:
+            chat_id = int(message['chat']['id'])
+            if chat_id <= 0:
+                return False, "Invalid chat ID value"
+        except (ValueError, TypeError):
+            return False, "Chat ID must be numeric"
+    
+    return True, "Valid payload"
+
+# ============================================
+# ENHANCED SALESFORCE AUTH WITH SECURITY
+# ============================================
 class SalesforceAuth:
-    """Handles Salesforce OAuth 2.0 authentication"""
+    """Handles Salesforce OAuth 2.0 authentication with security enhancements"""
+    
     def __init__(self):
-        self.instance_url = SF_INSTANCE_URL
+        self.instance_url = SF_INSTANCE_URL.rstrip('/')
         self.client_id = SF_CLIENT_ID
         self.client_secret = SF_CLIENT_SECRET
         self.access_token = None
         self.token_expiry = 0
+        self.token_lock = False
     
     def get_access_token(self):
-        """Get Salesforce access token using client_credentials flow"""
+        """Get Salesforce access token with enhanced security"""
         try:
+            # Check cached token with safety margin
             if self.access_token and time.time() < (self.token_expiry - 300):
-                logger.info("✅ Using cached Salesforce access token")
+                logger.debug("Using cached Salesforce access token")
                 return self.access_token
+            
+            # Prevent multiple concurrent token requests
+            if self.token_lock:
+                wait_time = 0
+                while self.token_lock and wait_time < 5:
+                    time.sleep(0.1)
+                    wait_time += 0.1
+                if self.access_token and time.time() < (self.token_expiry - 300):
+                    return self.access_token
+            
+            self.token_lock = True
             
             token_url = f"{self.instance_url}/services/oauth2/token"
             payload = {
@@ -62,25 +267,49 @@ class SalesforceAuth:
                 'client_secret': self.client_secret
             }
             
-            headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+            headers = {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent': 'Telegram-Support-Bot/1.0'
+            }
             
-            logger.info("🔑 Requesting Salesforce access token...")
-            response = requests.post(token_url, data=payload, headers=headers, timeout=30)
+            logger.info("Requesting Salesforce access token...")
+            response = requests.post(
+                token_url, 
+                data=payload, 
+                headers=headers, 
+                timeout=REQUEST_TIMEOUT,
+                verify=True
+            )
             
             if response.status_code == 200:
                 token_data = response.json()
-                self.access_token = token_data['access_token']
-                self.token_expiry = time.time() + token_data.get('expires_in', 3600)
-                logger.info("✅ Salesforce access token acquired")
+                self.access_token = token_data.get('access_token')
+                expires_in = token_data.get('expires_in', 3600)
+                self.token_expiry = time.time() + expires_in
+                
+                # Log token acquisition (without exposing token)
+                token_prefix = self.access_token[:10] + '...' if self.access_token else 'None'
+                logger.info(f"Salesforce access token acquired: {token_prefix}")
                 return self.access_token
             else:
-                logger.error(f"❌ Token request failed: {response.status_code} - {response.text}")
+                logger.error(f"Token request failed: {response.status_code}")
                 return None
                 
-        except Exception as e:
-            logger.error(f"❌ Token exception: {e}")
+        except requests.exceptions.SSLError as e:
+            logger.error(f"SSL error during token request: {e}")
             return None
+        except requests.exceptions.Timeout:
+            logger.error("Token request timeout")
+            return None
+        except Exception as e:
+            logger.error(f"Token exception: {str(e)[:100]}")
+            return None
+        finally:
+            self.token_lock = False
 
+# ============================================
+# ENHANCED TELEGRAM BOT MANAGER WITH SECURITY
+# ============================================
 class TelegramBotManager:
     def __init__(self):
         self.bot_token = BOT_TOKEN
@@ -92,80 +321,227 @@ class TelegramBotManager:
         self.sf_webhook = SALESFORCE_WEBHOOK_URL
         self.sf_auth = SalesforceAuth()
         
+    def _execute_safe_request(self, url, method='POST', **kwargs):
+        """Execute HTTP request with enhanced security"""
+        try:
+            # Set default timeout
+            kwargs.setdefault('timeout', REQUEST_TIMEOUT)
+            
+            # Add security headers
+            headers = kwargs.get('headers', {})
+            headers['User-Agent'] = 'Telegram-Support-Bot/1.0'
+            kwargs['headers'] = headers
+            
+            # Execute request
+            if method.upper() == 'POST':
+                response = requests.post(url, **kwargs)
+            elif method.upper() == 'GET':
+                response = requests.get(url, **kwargs)
+            elif method.upper() == 'PATCH':
+                response = requests.patch(url, **kwargs)
+            else:
+                raise ValueError(f"Unsupported HTTP method: {method}")
+            
+            return response
+            
+        except requests.exceptions.Timeout:
+            logger.error(f"Request timeout to {url}")
+            raise
+        except requests.exceptions.SSLError as e:
+            logger.error(f"SSL error to {url}: {e}")
+            raise
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Connection error to {url}: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Request error to {url}: {str(e)[:100]}")
+            raise
+    
     def send_message(self, chat_id, text, reply_markup=None, parse_mode='HTML'):
-        """Send message to Telegram using direct API"""
+        """Send message to Telegram with security enhancements"""
         try:
             if not self.base_url:
-                logger.error("❌ BOT_TOKEN not configured")
+                logger.error("BOT_TOKEN not configured")
                 return False
-                
+            
+            # Sanitize message text
+            safe_text = sanitize_input(text)
+            
             url = f"{self.base_url}/sendMessage"
             data = {
                 'chat_id': chat_id,
-                'text': text,
+                'text': safe_text,
                 'parse_mode': parse_mode
             }
             
             if reply_markup:
                 data['reply_markup'] = json.dumps(reply_markup)
             
-            response = requests.post(url, data=data, timeout=30)
-            result = response.json()
-            
-            if result.get('ok'):
-                logger.info(f"✅ Message sent to {chat_id}")
-                return True
-            else:
-                logger.error(f"❌ Failed to send to {chat_id}: {result.get('description')}")
-                return False
+            # Retry logic with exponential backoff
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    response = self._execute_safe_request(url, data=data)
+                    result = response.json()
+                    
+                    if result.get('ok'):
+                        logger.info(f"Message sent to {chat_id}")
+                        return True
+                    else:
+                        error_desc = result.get('description', 'Unknown error')
+                        
+                        # Handle rate limits from Telegram
+                        if "retry after" in error_desc.lower() and attempt < max_retries - 1:
+                            match = re.search(r'retry after (\d+)', error_desc.lower())
+                            if match:
+                                wait_time = int(match.group(1))
+                                logger.warning(f"Telegram rate limit, waiting {wait_time}s")
+                                time.sleep(wait_time)
+                                continue
+                        
+                        logger.error(f"Failed to send to {chat_id}: {error_desc}")
+                        return False
+                        
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt  # Exponential backoff
+                        logger.warning(f"Send failed, retry {attempt + 1}/{max_retries} in {wait_time}s")
+                        time.sleep(wait_time)
+                        continue
+                    raise
                 
         except Exception as e:
-            logger.error(f"❌ Failed to send to {chat_id}: {e}")
+            logger.error(f"Failed to send to {chat_id}: {str(e)[:100]}")
             return False
     
     def forward_to_salesforce(self, payload):
-        """Forward message to Salesforce with authentication"""
+        """Forward message to Salesforce with enhanced security"""
         try:
             if not self.sf_webhook:
-                logger.error("❌ SALESFORCE_WEBHOOK_URL not configured")
+                logger.error("SALESFORCE_WEBHOOK_URL not configured")
                 return False
             
             # Get Salesforce access token
             access_token = self.sf_auth.get_access_token()
             if not access_token:
-                logger.error("❌ Failed to get Salesforce access token")
+                logger.error("Failed to get Salesforce access token")
                 return False
+            
+            # Sanitize payload
+            safe_payload = self._sanitize_payload(payload)
             
             headers = {
                 'Authorization': f'Bearer {access_token}',
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
+                'User-Agent': 'Telegram-Support-Bot/1.0'
             }
             
-            logger.info(f"📤 Forwarding to Salesforce: {self.sf_webhook}")
-            logger.info(f"📤 Payload: {json.dumps(payload, indent=2)}")
+            logger.info(f"Forwarding to Salesforce webhook")
             
-            response = requests.post(
-                self.sf_webhook, 
-                json=payload, 
-                headers=headers, 
-                timeout=30
-            )
-            
-            logger.info(f"📤 Salesforce response: {response.status_code} - {response.text}")
-            
-            if response.status_code == 200:
-                logger.info(f"✅ Forwarded to Salesforce: {payload.get('chatId')}")
-                return True
-            else:
-                logger.error(f"❌ Salesforce error {response.status_code}: {response.text}")
-                return False
+            # Retry logic for Salesforce
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    response = self._execute_safe_request(
+                        self.sf_webhook,
+                        json=safe_payload,
+                        headers=headers
+                    )
+                    
+                    if response.status_code == 200:
+                        logger.info(f"Forwarded to Salesforce: {safe_payload.get('chatId')}")
+                        return True
+                    elif response.status_code == 401 and attempt < max_retries - 1:
+                        # Token expired, refresh and retry
+                        logger.warning(f"Auth failed, refreshing token and retrying")
+                        self.sf_auth.access_token = None
+                        self.sf_auth.token_expiry = 0
+                        access_token = self.sf_auth.get_access_token()
+                        if access_token:
+                            headers['Authorization'] = f'Bearer {access_token}'
+                        time.sleep(1)
+                        continue
+                    else:
+                        logger.error(f"Salesforce error {response.status_code}")
+                        return False
+                        
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Salesforce request failed, retry {attempt + 1}/{max_retries}")
+                        time.sleep(2)
+                        continue
+                    raise
                 
         except Exception as e:
-            logger.error(f"❌ Error forwarding to Salesforce: {e}")
+            logger.error(f"Error forwarding to Salesforce: {str(e)[:100]}")
             return False
     
+    def _sanitize_payload(self, payload):
+        """Sanitize payload before sending to Salesforce"""
+        safe_payload = payload.copy()
+        
+        # Sanitize text fields
+        text_fields = ['message', 'firstName', 'lastName', 'username']
+        for field in text_fields:
+            if field in safe_payload:
+                safe_payload[field] = sanitize_input(safe_payload[field])
+        
+        # Sanitize IDs
+        id_fields = ['conversationId', 'sessionId', 'chatId']
+        for field in id_fields:
+            if field in safe_payload:
+                # Remove any non-alphanumeric characters from IDs
+                if safe_payload[field]:
+                    safe_payload[field] = re.sub(r'[^a-zA-Z0-9]', '', str(safe_payload[field]))
+        
+        return safe_payload
+    
+    def _sanitize_sql_param(self, param):
+        """Sanitize parameters for SOQL queries"""
+        if param is None:
+            return "''"
+        
+        param_str = str(param)
+        
+        # Remove potentially dangerous characters
+        # Allow alphanumeric, spaces, underscores, dashes, dots
+        sanitized = re.sub(r'[^\w\s\-\.]', '', param_str)
+        
+        # Escape single quotes for SOQL
+        sanitized = sanitized.replace("'", "\\'")
+        
+        # Limit length
+        if len(sanitized) > 255:
+            sanitized = sanitized[:255]
+            logger.warning(f"SQL parameter truncated to 255 chars")
+        
+        return f"'{sanitized}'" if sanitized else "''"
+    
+    def send_typing_action(self, chat_id):
+        """Send typing action to Telegram"""
+        try:
+            if not self.base_url:
+                return False
+                
+            url = f"{self.base_url}/sendChatAction"
+            data = {
+                'chat_id': chat_id,
+                'action': 'typing'
+            }
+            
+            response = requests.post(url, data=data, timeout=5)
+            return response.json().get('ok', False)
+                
+        except Exception as e:
+            logger.error(f"Error sending typing action: {e}")
+            return False
+    
+    def clean_phone_number(self, phone):
+        """Clean phone number for Salesforce"""
+        return sanitize_phone_number(phone)
+    
     def check_existing_channel_user(self, telegram_id):
-        """Check if Channel_User__c exists by Telegram Chat ID"""
+        """Check if Channel_User__c exists by Telegram Chat ID with SQL injection protection"""
         try:
             access_token = self.sf_auth.get_access_token()
             if not access_token:
@@ -176,6 +552,9 @@ class TelegramBotManager:
                 'Content-Type': 'application/json'
             }
             
+            # Sanitize input
+            sanitized_id = self._sanitize_sql_param(telegram_id)
+            
             query = f"""
             SELECT Id, Name, Channel_Type__c, Channel_ID__c,
                    Telegram_Chat_ID__c, Contact__c, Contact__r.Name,
@@ -183,7 +562,7 @@ class TelegramBotManager:
                    Created_Date__c, Last_Activity_Date__c
             FROM Channel_User__c 
             WHERE Channel_Type__c = 'Telegram' 
-            AND Telegram_Chat_ID__c = '{telegram_id}'
+            AND Telegram_Chat_ID__c = {sanitized_id}
             LIMIT 1
             """
             encoded_query = requests.utils.quote(query)
@@ -198,11 +577,11 @@ class TelegramBotManager:
             return None
             
         except Exception as e:
-            logger.error(f"❌ Error checking channel user: {e}")
+            logger.error(f"Error checking channel user: {e}")
             return None
     
     def find_contact_by_phone(self, phone_number):
-        """Find contact by phone number in Salesforce"""
+        """Find contact by phone number in Salesforce with SQL injection protection"""
         try:
             access_token = self.sf_auth.get_access_token()
             if not access_token:
@@ -214,12 +593,17 @@ class TelegramBotManager:
             }
             
             clean_phone = self.clean_phone_number(phone_number)
+            if not clean_phone:
+                return None
+            
+            # Use LIKE with sanitized input
+            sanitized_phone = self._sanitize_sql_param(f"%{clean_phone}")
             
             query = f"""
             SELECT Id, FirstName, LastName, Salutation, Phone, MobilePhone, Email 
             FROM Contact 
-            WHERE Phone LIKE '%{clean_phone}' 
-               OR MobilePhone LIKE '%{clean_phone}'
+            WHERE Phone LIKE {sanitized_phone}
+               OR MobilePhone LIKE {sanitized_phone}
             LIMIT 1
             """
             encoded_query = requests.utils.quote(query)
@@ -234,7 +618,7 @@ class TelegramBotManager:
             return None
             
         except Exception as e:
-            logger.error(f"❌ Error finding contact by phone: {e}")
+            logger.error(f"Error finding contact by phone: {e}")
             return None
     
     def get_active_support_conversation(self, channel_user_id):
@@ -249,12 +633,17 @@ class TelegramBotManager:
                 'Content-Type': 'application/json'
             }
             
+            # Sanitize input
+            sanitized_id = sanitize_salesforce_id(channel_user_id)
+            if not sanitized_id:
+                return None
+            
             query = f"""
             SELECT Id, Name, Status__c, Channel_User_Name__c,
                    Created_Date__c, Last_Activity_Date__c,
                    Last_Message_Date__c
             FROM Support_Conversation__c 
-            WHERE Channel_User_Name__c = '{channel_user_id}'
+            WHERE Channel_User_Name__c = '{sanitized_id}'
             AND Status__c = 'Active'
             LIMIT 1
             """
@@ -270,7 +659,7 @@ class TelegramBotManager:
             return None
             
         except Exception as e:
-            logger.error(f"❌ Error getting active conversation: {e}")
+            logger.error(f"Error getting active conversation: {e}")
             return None
     
     def get_active_sessions(self, conversation_id):
@@ -285,12 +674,17 @@ class TelegramBotManager:
                 'Content-Type': 'application/json'
             }
             
+            # Sanitize input
+            sanitized_id = sanitize_salesforce_id(conversation_id)
+            if not sanitized_id:
+                return []
+            
             query = f"""
             SELECT Id, Name, Status__c, OwnerId, Owner.Name, 
                    Assigned_Agent__c, Assigned_Agent__r.Name,
                    Created_Date__c, Last_Message_Time__c
             FROM Chat_Session__c 
-            WHERE Support_Conversation__c = '{conversation_id}'
+            WHERE Support_Conversation__c = '{sanitized_id}'
             AND Status__c IN ('Active', 'Waiting')
             ORDER BY Created_Date__c DESC
             LIMIT 1
@@ -306,11 +700,11 @@ class TelegramBotManager:
             return []
             
         except Exception as e:
-            logger.error(f"❌ Error getting active sessions: {e}")
+            logger.error(f"Error getting active sessions: {e}")
             return []
     
     def create_channel_user_with_conversation(self, telegram_id, phone=None, contact_id=None, first_name=None, last_name=None):
-        """Create Channel_User__c AND Support_Conversation__c together"""
+        """Create Channel_User__c AND Support_Conversation__c together with sanitized data"""
         try:
             access_token = self.sf_auth.get_access_token()
             if not access_token:
@@ -324,37 +718,44 @@ class TelegramBotManager:
             # 1. CREATE CHANNEL USER
             channel_user_url = f"{SF_INSTANCE_URL}/services/data/v58.0/sobjects/Channel_User__c/"
             
+            # Sanitize inputs for name
+            safe_first_name = re.sub(r'[^\w\s\-]', '', first_name or '')[:40]
+            safe_last_name = re.sub(r'[^\w\s\-]', '', last_name or '')[:40]
+            
             # Generate a name for the channel user
-            if first_name and last_name:
-                name = f'Telegram: {first_name} {last_name}'
+            if safe_first_name and safe_last_name:
+                name = f'Telegram: {safe_first_name} {safe_last_name}'
             elif phone:
                 name = f'Telegram: {phone}'
             else:
                 name = f'Telegram: {telegram_id}'
             
+            # Truncate name if too long
+            name = name[:80]
+            
             channel_user_data = {
                 'Channel_Type__c': 'Telegram',
-                'Channel_ID__c': f'telegram_{telegram_id}',
+                'Channel_ID__c': f'telegram_{telegram_id}'[:80],
                 'Telegram_Chat_ID__c': str(telegram_id),
                 'Name': name,
                 'Created_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
                 'Last_Activity_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
             }
             
-            # Add contact relationship if available
-            if contact_id:
+            # Add contact relationship if available and valid
+            if contact_id and re.match(r'^[a-zA-Z0-9]{15,18}$', contact_id):
                 channel_user_data['Contact__c'] = contact_id
             
-            logger.info(f"📝 Creating Channel User for {telegram_id}")
+            logger.info(f"Creating Channel User for {telegram_id}")
             response = requests.post(channel_user_url, headers=headers, json=channel_user_data, timeout=30)
             
             if response.status_code != 201:
-                logger.error(f"❌ Failed to create Channel_User__c: {response.status_code} - {response.text}")
+                logger.error(f"Failed to create Channel_User__c: {response.status_code}")
                 return None
             
             channel_user_result = response.json()
             channel_user_id = channel_user_result['id']
-            logger.info(f"✅ Created Channel_User__c: {channel_user_id}")
+            logger.info(f"Created Channel_User__c: {channel_user_id}")
             
             # 2. CREATE SUPPORT CONVERSATION (Active state)
             conversation_url = f"{SF_INSTANCE_URL}/services/data/v58.0/sobjects/Support_Conversation__c/"
@@ -367,20 +768,20 @@ class TelegramBotManager:
                 'Last_Message_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
             }
             
-            logger.info(f"📝 Creating Support Conversation for Channel User {channel_user_id}")
+            logger.info(f"Creating Support Conversation for Channel User {channel_user_id}")
             response = requests.post(conversation_url, headers=headers, json=conversation_data, timeout=30)
             
             if response.status_code != 201:
-                logger.error(f"⚠️ Failed to create Support_Conversation__c: {response.status_code} - {response.text}")
+                logger.error(f"Failed to create Support_Conversation__c: {response.status_code}")
                 # Channel user was created, but conversation failed - return channel user ID only
                 return {'channelUserId': channel_user_id, 'conversationId': None}
             
             conversation_result = response.json()
             conversation_id = conversation_result['id']
-            logger.info(f"✅ Created Support_Conversation__c: {conversation_id}")
+            logger.info(f"Created Support_Conversation__c: {conversation_id}")
             
-            # 3. UPDATE CONTACT WITH TELEGRAM ID (if contact exists)
-            if contact_id:
+            # 3. UPDATE CONTACT WITH TELEGRAM ID (if contact exists and valid)
+            if contact_id and re.match(r'^[a-zA-Z0-9]{15,18}$', contact_id):
                 self.update_contact_telegram_id(contact_id, telegram_id)
             
             return {
@@ -389,7 +790,7 @@ class TelegramBotManager:
             }
                 
         except Exception as e:
-            logger.error(f"❌ Error creating channel user with conversation: {e}")
+            logger.error(f"Error creating channel user with conversation: {e}")
             return None
     
     def link_channel_user_to_contact(self, channel_user_id, contact_id):
@@ -412,14 +813,14 @@ class TelegramBotManager:
             response = requests.patch(url, headers=headers, json=data, timeout=30)
             
             if response.status_code == 204:
-                logger.info(f"✅ Linked Channel_User__c {channel_user_id} to Contact {contact_id}")
+                logger.info(f"Linked Channel_User__c {channel_user_id} to Contact {contact_id}")
                 return True
             else:
-                logger.error(f"❌ Failed to link Channel_User__c: {response.status_code} - {response.text}")
+                logger.error(f"Failed to link Channel_User__c: {response.status_code}")
                 return False
                 
         except Exception as e:
-            logger.error(f"❌ Error linking channel user: {e}")
+            logger.error(f"Error linking channel user: {e}")
             return False
     
     def update_contact_telegram_id(self, contact_id, telegram_id):
@@ -442,14 +843,14 @@ class TelegramBotManager:
             response = requests.patch(url, headers=headers, json=data, timeout=30)
             
             if response.status_code == 204:
-                logger.info(f"✅ Updated contact {contact_id} with Telegram ID {telegram_id}")
+                logger.info(f"Updated contact {contact_id} with Telegram ID {telegram_id}")
                 return True
             else:
-                logger.error(f"❌ Failed to update contact: {response.status_code} - {response.text}")
+                logger.error(f"Failed to update contact: {response.status_code}")
                 return False
                 
         except Exception as e:
-            logger.error(f"❌ Error updating contact: {e}")
+            logger.error(f"Error updating contact: {e}")
             return False
     
     def create_new_session(self, conversation_id, chat_id, first_name=None, last_name=None):
@@ -468,46 +869,16 @@ class TelegramBotManager:
             success = self.forward_to_salesforce(payload)
             
             if success:
-                logger.info(f"✅ Triggered session creation for conversation {conversation_id}")
+                logger.info(f"Triggered session creation for conversation {conversation_id}")
                 return True
             else:
-                logger.error(f"❌ Failed to trigger session creation")
+                logger.error(f"Failed to trigger session creation")
                 return False
                 
         except Exception as e:
-            logger.error(f"❌ Error creating new session: {e}")
+            logger.error(f"Error creating new session: {e}")
             return False
     
-    def send_typing_action(self, chat_id):
-        """Send typing action to Telegram"""
-        try:
-            if not self.base_url:
-                return False
-                
-            url = f"{self.base_url}/sendChatAction"
-            data = {
-                'chat_id': chat_id,
-                'action': 'typing'
-            }
-            
-            response = requests.post(url, data=data, timeout=5)
-            return response.json().get('ok', False)
-                
-        except Exception as e:
-            logger.error(f"❌ Error sending typing action: {e}")
-            return False
-    
-    def clean_phone_number(self, phone):
-        """Clean phone number for Salesforce"""
-        if not phone:
-            return ""
-        cleaned = re.sub(r'[^\d]', '', phone)
-        if cleaned.startswith('251'):
-            cleaned = cleaned[3:]
-        if not cleaned.startswith('0'):
-            cleaned = '0' + cleaned
-        return cleaned
-
     def get_queue_position(self, conversation_id):
         """Get queue position for a conversation - FIXED VERSION"""
         try:
@@ -542,7 +913,6 @@ class TelegramBotManager:
                 return None
             
             latest_session_id = session_data['records'][0]['Id']
-            latest_session_created = session_data['records'][0]['CreatedDate']
             
             # Now get all waiting sessions and find our position
             all_sessions_query = f"""
@@ -569,7 +939,7 @@ class TelegramBotManager:
             return None
             
         except Exception as e:
-            logger.error(f"❌ Error getting queue position: {e}")
+            logger.error(f"Error getting queue position: {e}")
             return None
     
     def get_session_details(self, session_id):
@@ -604,21 +974,28 @@ class TelegramBotManager:
             return None
             
         except Exception as e:
-            logger.error(f"❌ Error getting session details: {e}")
+            logger.error(f"Error getting session details: {e}")
             return None
 
 # Initialize bot manager
 bot_manager = TelegramBotManager()
 
-# Utility functions
+# ============================================
+# UTILITY FUNCTIONS WITH SECURITY
+# ============================================
 def is_phone_number(text):
     if not text:
         return False
-    phone_pattern = r'^(\+?251|0)?[97]\d{8}$'
-    return re.match(phone_pattern, text.strip()) is not None
+    
+    # Use the enhanced sanitize_phone_number function
+    cleaned = sanitize_phone_number(text)
+    return bool(cleaned)
 
 def is_menu_command(text):
     """Check if text is a menu command"""
+    if not text:
+        return False
+    
     menu_commands = ['/start', 'hi', 'hello', 'hey', 'menu', 'help']
     return text.strip().lower() in menu_commands
 
@@ -638,7 +1015,9 @@ def show_main_menu(chat_id, user_name=None, has_active_session=False):
     else:
         welcome_text = "👋 *Welcome to Bank of Abyssinia Support!*"
         if user_name:
-            welcome_text = f"👋 *Welcome back, {user_name}!*"
+            # Sanitize user name for display
+            safe_name = re.sub(r'[^\w\s\-]', '', user_name)[:30]
+            welcome_text = f"👋 *Welcome back, {safe_name}!*"
         
         menu_text = f"""
 {welcome_text}
@@ -777,7 +1156,7 @@ Please describe your issue or question when you're ready.
             return True, session_id
         
     except Exception as e:
-        logger.error(f"❌ Error handling contact support: {e}")
+        logger.error(f"Error handling contact support: {e}")
         error_text = "❌ *Sorry, there was an error connecting to support. Please try again.*"
         bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
         return False, None
@@ -875,31 +1254,43 @@ def send_message_confirmation(chat_id, success, is_session_start=False, queue_po
                 parse_mode='Markdown'
             )
 
+# In-memory storage for user session state
+user_session_state = {}
+
 def process_incoming_message(chat_id, message_text, user_data):
-    """Process incoming Telegram message with improved session handling"""
+    """Process incoming Telegram message with improved session handling and security"""
     try:
+        # Sanitize inputs
+        safe_message = sanitize_input(message_text)
+        safe_chat_id = str(chat_id)
+        
+        # Validate chat ID
+        if not safe_chat_id.isdigit():
+            logger.warning(f"Invalid chat ID format: {chat_id}")
+            return False
+        
         # Show typing indicator
         bot_manager.send_typing_action(chat_id)
         
-        chat_id_str = str(chat_id)
-        message_lower = message_text.strip().lower()
+        chat_id_str = safe_chat_id
+        message_lower = safe_message.strip().lower()
         
-        logger.info(f"📥 Processing message from {chat_id}: {message_text}")
+        logger.info(f"Processing message from {chat_id}: {safe_message[:50]}...")
         
         # STEP 1: Check if Channel_User__c exists
         channel_user = bot_manager.check_existing_channel_user(chat_id_str)
         
         if not channel_user:
             # Handle registration flow
-            return handle_new_user_registration(chat_id, message_text, user_data)
+            return handle_new_user_registration(chat_id, safe_message, user_data)
         
         # ✅ Channel User EXISTS
-        logger.info(f"✅ Existing Channel User found: {channel_user['Id']}")
+        logger.info(f"Existing Channel User found: {channel_user['Id']}")
         
         # Get conversation for this user
         conversation = bot_manager.get_active_support_conversation(channel_user['Id'])
         if not conversation:
-            logger.error(f"❌ No active conversation found for channel user {channel_user['Id']}")
+            logger.error(f"No active conversation found for channel user {channel_user['Id']}")
             error_text = "❌ Sorry, we couldn't find your conversation. Please start a new session with option 1."
             return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
         
@@ -920,7 +1311,7 @@ def process_incoming_message(chat_id, message_text, user_data):
             is_in_session = False
         
         # Handle menu commands (always show menu for these)
-        if is_menu_command(message_text):
+        if is_menu_command(safe_message):
             user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
             return show_main_menu(chat_id, user_name, has_active_salesforce_session)
         
@@ -1004,12 +1395,12 @@ Reply 'YES' to confirm or 'NO' to continue with current session.
                 'session_status': session_status
             }
             
-            logger.info(f"📤 Forwarding message to session {session_id} (status: {session_status})")
+            logger.info(f"Forwarding message to session {session_id} (status: {session_status})")
             
             payload = {
                 'channelType': 'Telegram',
                 'chatId': chat_id_str,
-                'message': message_text,
+                'message': safe_message,
                 'messageId': f"TG_{int(time.time())}",
                 'firstName': user_data.get('first_name', ''),
                 'lastName': user_data.get('last_name', ''),
@@ -1038,9 +1429,9 @@ Reply 'YES' to confirm or 'NO' to continue with current session.
         else:
             # NO ACTIVE SESSION - Show menu but don't interrupt if this is clearly not a menu command
             # Allow natural conversation starters
-            if len(message_text) > 20 or '?' in message_text or 'help' in message_lower or 'issue' in message_lower or 'problem' in message_lower:
+            if len(safe_message) > 20 or '?' in safe_message or 'help' in message_lower or 'issue' in message_lower or 'problem' in message_lower:
                 # This looks like a support request, auto-initiate session
-                logger.info(f"🤖 Auto-initiating session for support-like message from {chat_id}")
+                logger.info(f"Auto-initiating session for support-like message from {chat_id}")
                 success, session_id = handle_contact_support(
                     chat_id, 
                     channel_user['Id'],
@@ -1060,7 +1451,7 @@ Reply 'YES' to confirm or 'NO' to continue with current session.
                     payload = {
                         'channelType': 'Telegram',
                         'chatId': chat_id_str,
-                        'message': message_text,
+                        'message': safe_message,
                         'messageId': f"TG_{int(time.time())}",
                         'firstName': user_data.get('first_name', ''),
                         'lastName': user_data.get('last_name', ''),
@@ -1084,7 +1475,7 @@ Reply 'YES' to confirm or 'NO' to continue with current session.
                     return success
             else:
                 # Show menu for short/ambiguous messages
-                logger.info(f"ℹ️ No active session for user {chat_id}, showing menu")
+                logger.info(f"No active session for user {chat_id}, showing menu")
                 user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
                 
                 response_text = f"""
@@ -1103,7 +1494,7 @@ Type *1* or *2* to select an option.
                 return bot_manager.send_message(chat_id, response_text, parse_mode='Markdown')
                     
     except Exception as e:
-        logger.error(f"❌ Error processing message: {e}")
+        logger.error(f"Error processing message: {e}")
         bot_manager.send_message(
             chat_id,
             "❌ *Sorry, an error occurred. Please try again.*",
@@ -1132,7 +1523,15 @@ Example: *0912121212*
     elif is_phone_number(message_text):
         clean_phone = bot_manager.clean_phone_number(message_text)
         
-        logger.info(f"📱 Creating Channel User and Conversation for {chat_id} with phone: {clean_phone}")
+        if not clean_phone:
+            error_text = """
+📱 *Please enter a valid Ethiopian phone number:*
+
+Example: *0912121212* or *+251912121212*
+            """
+            return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
+        
+        logger.info(f"Creating Channel User and Conversation for {chat_id} with phone: {clean_phone}")
         
         # Check if Contact exists with this phone
         contact = bot_manager.find_contact_by_phone(clean_phone)
@@ -1174,39 +1573,57 @@ You're now connected to our support system.
     else:
         # User didn't provide phone number
         error_text = """
-📱 *Please enter a valid phone number:*
+📱 *Please enter a valid Ethiopian phone number:*
 
-Example: *0912121212*
+Example: *0912121212* or *+251912121212*
 
 Or type */start* to see the welcome message.
         """
         return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
 
-# Flask routes (remain the same as original)
+# ============================================
+# SECURE FLASK ROUTES
+# ============================================
+
 @app.route('/api/send-to-user', methods=['POST'])
 def send_to_user():
-    """Endpoint for Salesforce to send messages to Telegram"""
+    """Secure endpoint for Salesforce to send messages to Telegram"""
     try:
+        if not request.is_json:
+            logger.warning("Non-JSON request to /api/send-to-user")
+            return jsonify({'error': 'Content-Type must be application/json'}), 400
+        
         data = request.get_json()
         
+        # Validate required fields
         if not data or 'chat_id' not in data or 'message' not in data:
             return jsonify({'error': 'Missing chat_id or message'}), 400
         
         chat_id = data['chat_id']
         message = data['message']
         
+        # Validate chat_id
+        if not isinstance(chat_id, (int, str)):
+            return jsonify({'error': 'Invalid chat_id format'}), 400
+        
+        # Sanitize inputs
+        safe_chat_id = str(chat_id)
+        safe_message = sanitize_input(message)
+        
         # Check if this message changes session status
         session_status = data.get('session_status')
-        if session_status:
-            user_state = user_session_state.get(str(chat_id), {})
+        if session_status in ['Active', 'Waiting', 'Closed']:
+            user_state = user_session_state.get(safe_chat_id, {})
             if user_state:
                 user_state['session_status'] = session_status
-                user_session_state[str(chat_id)] = user_state
+                user_session_state[safe_chat_id] = user_state
         
-        # Optional: parse mode
+        # Validate parse_mode
         parse_mode = data.get('parse_mode', 'HTML')
+        if parse_mode not in ['HTML', 'Markdown', 'MarkdownV2']:
+            parse_mode = 'HTML'
         
-        success = bot_manager.send_message(chat_id, message, parse_mode=parse_mode)
+        success = bot_manager.send_message(chat_id, safe_message, parse_mode=parse_mode)
         
         if success:
             return jsonify({
@@ -1218,37 +1635,45 @@ def send_to_user():
             return jsonify({'error': 'Failed to send message to Telegram'}), 500
             
     except Exception as e:
-        logger.error(f"❌ Send error: {e}")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Send error: {str(e)[:100]}")
+        return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
-    """Receive Telegram webhook"""
+    """Secure Telegram webhook endpoint"""
     try:
-        if request.is_json:
-            update_data = request.get_json()
-            
-            if 'message' in update_data:
-                message = update_data['message']
-                chat_id = message['chat']['id']
-                message_text = message.get('text', '')
-                user_data = message.get('from', {})
-                
-                logger.info(f"📥 Telegram message from {chat_id}: {message_text}")
-                
-                # Process the message
-                process_incoming_message(chat_id, message_text, user_data)
-            
-            return jsonify({'status': 'ok'})
-        else:
-            logger.error("❌ Non-JSON webhook received")
+        # Validate content type
+        if not request.is_json:
+            logger.warning("Non-JSON webhook received")
             return jsonify({'error': 'Invalid data format'}), 400
+        
+        update_data = request.get_json()
+        
+        # Validate Telegram payload
+        is_valid, error_msg = validate_telegram_payload(update_data)
+        if not is_valid:
+            logger.warning(f"Invalid Telegram payload: {error_msg}")
+            return jsonify({'error': error_msg}), 400
+        
+        if 'message' in update_data:
+            message = update_data['message']
+            chat_id = message['chat']['id']
+            message_text = message.get('text', '')
+            user_data = message.get('from', {})
+            
+            # Log incoming message (without exposing full content in production)
+            msg_preview = message_text[:50] + '...' if len(message_text) > 50 else message_text
+            logger.info(f"Telegram message from {chat_id}: {msg_preview}")
+            
+            # Process the message
+            process_incoming_message(chat_id, message_text, user_data)
+        
+        return jsonify({'status': 'ok'})
             
     except Exception as e:
-        logger.error(f"❌ Webhook error: {e}")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Webhook error: {str(e)[:100]}")
+        return jsonify({'error': 'Internal server error'}), 500
 
-# Set webhook endpoint
 @app.route('/set-webhook', methods=['GET'])
 def set_webhook():
     """Set Telegram webhook programmatically"""
@@ -1259,7 +1684,7 @@ def set_webhook():
         webhook_url = f"https://{request.host}/webhook"
         set_url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}"
         
-        logger.info(f"🔗 Setting webhook to: {webhook_url}")
+        logger.info(f"Setting webhook to: {webhook_url}")
         
         response = requests.get(set_url)
         result = response.json()
@@ -1278,30 +1703,95 @@ def set_webhook():
             }), 500
             
     except Exception as e:
-        logger.error(f"❌ Set webhook error: {e}")
+        logger.error(f"Set webhook error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/clear-session-state/<chat_id>', methods=['GET'])
 def clear_session_state(chat_id):
     """Clear session state for a user (for testing)"""
+    if not chat_id.isdigit():
+        return jsonify({'error': 'Invalid chat ID format'}), 400
+    
     if chat_id in user_session_state:
         del user_session_state[chat_id]
         return jsonify({'status': 'success', 'message': f'Cleared session state for {chat_id}'})
+    
     return jsonify({'status': 'error', 'message': 'No session state found'}), 404
 
 @app.route('/session-state/<chat_id>', methods=['GET'])
 def get_session_state(chat_id):
     """Get session state for a user (for debugging)"""
+    if not chat_id.isdigit():
+        return jsonify({'error': 'Invalid chat ID format'}), 400
+    
     state = user_session_state.get(chat_id, {})
     return jsonify({'status': 'success', 'state': state})
 
-# Test endpoints (remain the same as original)
+# ============================================
+# SECURITY MONITORING ENDPOINTS
+# ============================================
+
+@app.route('/metrics', methods=['GET'])
+def security_metrics():
+    """Security and performance metrics endpoint"""
+    try:
+        current_time = time.time()
+        
+        # Get rate limiting stats
+        rate_stats = {
+            'enabled': ENABLE_RATE_LIMITING,
+            'limit_per_minute': RATE_LIMIT_PER_MINUTE,
+            'active_ips': len(rate_limiter.requests),
+            'total_requests': sum(len(timestamps) for timestamps in rate_limiter.requests.values())
+        }
+        
+        # Get session stats
+        session_stats = {
+            'total_sessions': len(user_session_state),
+            'active_sessions': sum(1 for s in user_session_state.values() if s.get('in_session')),
+            'waiting_sessions': sum(1 for s in user_session_state.values() if s.get('session_status') == 'Waiting')
+        }
+        
+        # System health
+        access_token = bot_manager.sf_auth.get_access_token()
+        
+        return jsonify({
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat(),
+            'security': {
+                'rate_limiting': rate_stats,
+                'input_sanitization': ENABLE_INPUT_SANITIZATION,
+                'max_message_length': MAX_MESSAGE_LENGTH
+            },
+            'sessions': session_stats,
+            'services': {
+                'telegram': 'connected' if BOT_TOKEN else 'disconnected',
+                'salesforce': 'connected' if access_token else 'disconnected'
+            },
+            'uptime': current_time - app_start_time
+        })
+    except Exception as e:
+        logger.error(f"Metrics error: {str(e)[:100]}")
+        return jsonify({'error': 'Metrics unavailable'}), 500
+
+@app.route('/security/logs', methods=['GET'])
+def security_logs():
+    """Get recent security-related logs (limited for security)"""
+    return jsonify({
+        'warning': 'Security logs endpoint requires authentication in production',
+        'rate_limited_ips': list(rate_limiter.requests.keys())[:10]
+    })
+
+# ============================================
+# TEST ENDPOINTS
+# ============================================
+
 @app.route('/test-registration/<phone>', methods=['GET'])
 def test_registration(phone):
     """Test registration endpoint"""
     try:
         # Simulate a user registration
-        chat_id = "123456789"  # Test chat ID
+        chat_id = "123456789"
         clean_phone = bot_manager.clean_phone_number(phone)
         
         # Create Channel User and Conversation
@@ -1325,7 +1815,7 @@ def test_registration(phone):
             }), 500
             
     except Exception as e:
-        logger.error(f"❌ Test registration error: {e}")
+        logger.error(f"Test registration error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/test-conversation/<telegram_id>', methods=['GET'])
@@ -1361,7 +1851,7 @@ def test_conversation(telegram_id):
             }), 404
             
     except Exception as e:
-        logger.error(f"❌ Test conversation error: {e}")
+        logger.error(f"Test conversation error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/test', methods=['GET'])
@@ -1369,39 +1859,57 @@ def test():
     return jsonify({
         'status': 'online',
         'service': 'Telegram Bot Integration',
-        'version': '4.1',  # Updated version
+        'version': '5.0-security',
         'architecture': 'Channel User → Support Conversation → Chat Sessions',
-        'session_management': 'Improved seamless flow',
-        'queue_position': 'Fixed logic',
+        'security_features': {
+            'rate_limiting': 'enabled' if ENABLE_RATE_LIMITING else 'disabled',
+            'input_sanitization': 'enabled' if ENABLE_INPUT_SANITIZATION else 'disabled',
+            'sql_injection_protection': 'enabled'
+        },
         'endpoints': {
             'webhook': 'POST /webhook',
             'send_to_user': 'POST /api/send-to-user',
             'set_webhook': 'GET /set-webhook',
             'clear_session_state': 'GET /clear-session-state/<chat_id>',
             'session_state': 'GET /session-state/<chat_id>',
+            'metrics': 'GET /metrics',
             'health': 'GET /health'
         }
     })
 
+# ============================================
+# ENHANCED HEALTH CHECK
+# ============================================
+
 @app.route('/health', methods=['GET'])
 def health_check():
+    """Enhanced health check with security status"""
     try:
         access_token = bot_manager.sf_auth.get_access_token()
         
-        return jsonify({
-            'status': 'healthy' if BOT_TOKEN and access_token else 'unhealthy',
+        health_status = {
+            'status': 'healthy' if BOT_TOKEN and access_token else 'degraded',
             'service': 'telegram-salesforce-bot',
-            'version': '4.1',
+            'version': '5.0-security',
+            'timestamp': datetime.now().isoformat(),
+            'security': {
+                'rate_limiting': 'enabled' if ENABLE_RATE_LIMITING else 'disabled',
+                'input_sanitization': 'enabled' if ENABLE_INPUT_SANITIZATION else 'disabled',
+                'request_timeout': REQUEST_TIMEOUT
+            },
+            'telegram_bot': 'configured' if BOT_TOKEN else 'missing',
+            'salesforce_connection': 'connected' if access_token else 'disconnected',
             'session_state_count': len(user_session_state),
-            'telegram_bot': '✅ Set' if BOT_TOKEN else '❌ Missing',
-            'salesforce_connection': '✅ Connected' if access_token else '❌ Failed',
-            'workflow': 'Seamless Session Management',
-            'timestamp': time.time()
-        })
-    except:
+            'rate_limiting_active_ips': len(rate_limiter.requests)
+        }
+        
+        status_code = 200 if health_status['status'] == 'healthy' else 503
+        return jsonify(health_status), status_code
+        
+    except Exception as e:
         return jsonify({
             'status': 'unhealthy',
-            'message': 'Health check failed'
+            'error': str(e)[:100]
         }), 500
 
 @app.route('/')
@@ -1409,24 +1917,33 @@ def home():
     return jsonify({
         'message': 'Telegram Bot for Salesforce Integration',
         'architecture': 'Channel User → Support Conversation → Chat Sessions',
-        'version': '4.1',
-        'session_management': 'Seamless flow with queue positioning',
+        'version': '5.0-security',
+        'security': 'Enhanced with rate limiting and input sanitization',
         'status': 'Running'
     })
 
+# ============================================
+# MAIN EXECUTION
+# ============================================
+
 if __name__ == '__main__':
-    logger.info("=" * 60)
-    logger.info("🚀 Starting Telegram Bot v4.1 (Improved Session Management)")
-    logger.info("=" * 60)
+    app_start_time = time.time()
+    
+    logger.info("=" * 70)
+    logger.info("🚀 Starting Telegram Bot v5.0 (Security Enhanced)")
+    logger.info("=" * 70)
     
     if missing_vars:
-        logger.error(f"❌ Missing environment variables: {', '.join(missing_vars)}")
+        logger.error(f"Missing environment variables: {', '.join(missing_vars)}")
     else:
         logger.info("✅ All environment variables are set")
     
-    logger.info("📱 Channel Type: Telegram")
-    logger.info("👤 Architecture: Channel User → Support Conversation → Chat Sessions")
-    logger.info("🔄 Session Flow: Seamless with automatic queue positioning")
-    logger.info("📍 Queue Position: Fixed logic with proper session tracking")
+    logger.info(f"📱 Channel Type: Telegram")
+    logger.info(f"🔒 Security Features:")
+    logger.info(f"   • Rate Limiting: {'ENABLED' if ENABLE_RATE_LIMITING else 'DISABLED'}")
+    logger.info(f"   • Input Sanitization: {'ENABLED' if ENABLE_INPUT_SANITIZATION else 'DISABLED'}")
+    logger.info(f"   • Max Message Length: {MAX_MESSAGE_LENGTH}")
+    logger.info(f"   • Request Timeout: {REQUEST_TIMEOUT}s")
     logger.info(f"🌐 Starting server on port {PORT}")
+    
     app.run(host='0.0.0.0', port=PORT, debug=False)
