@@ -1437,6 +1437,41 @@ def handle_new_user_registration_callback(chat_id, callback_data, user_data):
     chat_id_str = str(chat_id)
     
     if callback_data == 'register_phone':
+        # FIRST check if user is already registered
+        channel_user = bot_manager.check_existing_channel_user(chat_id_str)
+        if channel_user:
+            # User is already registered, show main menu
+            user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
+            return show_main_menu(chat_id, user_name, has_active_session=False)
+        
+        # Check if user is already in registration flow
+        if chat_id_str in registration_flow:
+            current_state = registration_flow[chat_id_str]
+            current_step = current_state.get('step')
+            
+            if current_step == 'phone_requested':
+                # Already asked for phone, remind them
+                reminder_text = """
+📱 *We're waiting for your phone number.*
+
+Please enter your phone number:
+
+Example: *0912121212* or *+251912121212*
+                """
+                bot_manager.send_message(chat_id, reminder_text, parse_mode='Markdown')
+                return True
+            elif current_step == 'name_requested':
+                # Already asked for name, remind them
+                reminder_text = """
+📝 *We're waiting for your name.*
+
+Please enter your first and last name:
+
+Example: *John Smith*
+                """
+                bot_manager.send_message(chat_id, reminder_text, parse_mode='Markdown')
+                return True
+        
         # Set registration state to expect phone number
         registration_flow[chat_id_str] = {'step': 'phone_requested'}
         
@@ -1481,28 +1516,43 @@ def process_incoming_message(chat_id, message_text, user_data):
             if chat_id_str in registration_flow:
                 # Handle registration flow
                 return handle_new_user_registration(chat_id, safe_message, user_data)
-            else:
-                # User is not registered and not in registration flow
-                # Check if this is a menu command or /start
-                if is_menu_command(safe_message) or message_lower == '/start':
-                    return handle_new_user_registration(chat_id, safe_message, user_data)
-                else:
-                    # User sent a message without being registered
-                    # Ask them to register first
-                    keyboard = {
-                        "inline_keyboard": [
-                            [{"text": "📱 Register with Phone Number", "callback_data": "register_phone"}]
-                        ]
-                    }
-                    
-                    registration_text = """
-👋 *Welcome to Bank of Abyssinia Support!*
+            
+            # If user sent /start or a menu command, show registration button
+            if is_menu_command(safe_message) or message_lower == '/start':
+                # Show registration button (but don't ask for phone directly)
+                registration_flow[chat_id_str] = {'step': 'start'}
+                
+                keyboard = {
+                    "inline_keyboard": [
+                        [{"text": "📱 Register with Phone Number", "callback_data": "register_phone"}]
+                    ]
+                }
+                
+                welcome_text = """
+        👋 *Welcome to Bank of Abyssinia Support!*
 
-To use our support services, please register first by clicking the button below.
-                    """
-                    return bot_manager.send_message(chat_id, registration_text, 
-                                                  reply_markup=keyboard, 
-                                                  parse_mode='Markdown')
+        To get started with our support services, we need to register you in our system.
+                """
+                return bot_manager.send_message(chat_id, welcome_text, 
+                                                reply_markup=keyboard, 
+                                                parse_mode='Markdown')
+            
+            # If user sent any other message without being registered
+            # Show registration button
+            keyboard = {
+                "inline_keyboard": [
+                    [{"text": "📱 Register with Phone Number", "callback_data": "register_phone"}]
+                ]
+            }
+            
+            registration_text = """
+        👋 *Welcome to Bank of Abyssinia Support!*
+
+        To use our support services, please register first by clicking the button below.
+            """
+            return bot_manager.send_message(chat_id, registration_text, 
+                                            reply_markup=keyboard, 
+                                            parse_mode='Markdown')
         
         # ✅ Channel User EXISTS
         logger.info(f"Existing Channel User found: {channel_user['Id']}")
@@ -1761,26 +1811,26 @@ def handle_new_user_registration(chat_id, message_text, user_data):
     # Check if user is in registration flow
     registration_state = registration_flow.get(chat_id_str, {})
     
-    if message_lower == '/start' or not registration_state:
-        # Reset registration state and show initial registration button
-        registration_flow[chat_id_str] = {'step': 'start'}
-        
-        # Use buttons for new users
-        keyboard = {
-            "inline_keyboard": [
-                [{"text": "📱 Register with Phone Number", "callback_data": "register_phone"}]
-            ]
-        }
-        
-        welcome_text = """
-👋 *Welcome to Bank of Abyssinia Support!*
-
-To get started with our support services, we need to register you in our system.
-        """
-        bot_manager.send_message(chat_id, welcome_text, 
-                               reply_markup=keyboard, 
-                               parse_mode='Markdown')
-        return True
+    # if message_lower == '/start' or not registration_state:
+    #     # Reset registration state and show initial registration button
+    #     registration_flow[chat_id_str] = {'step': 'start'}
+    #     
+    #     # Use buttons for new users
+    #     keyboard = {
+    #         "inline_keyboard": [
+    #             [{"text": "📱 Register with Phone Number", "callback_data": "register_phone"}]
+    #         ]
+    #     }
+    #     
+    #     welcome_text = """
+    # 👋 *Welcome to Bank of Abyssinia Support!*
+    # 
+    # To get started with our support services, we need to register you in our system.
+    #     """
+    #     bot_manager.send_message(chat_id, welcome_text, 
+    #                            reply_markup=keyboard, 
+    #                            parse_mode='Markdown')
+    #     return True
     
     # Handle registration flow steps
     current_step = registration_state.get('step')
