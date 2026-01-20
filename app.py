@@ -749,95 +749,103 @@ class TelegramBotManager:
             logger.error(f"Error getting active sessions: {e}")
             return []
     
-    def create_channel_user_with_conversation(self, telegram_id, phone=None, contact_id=None, first_name=None, last_name=None):
-        """Create Channel_User__c AND Support_Conversation__c together with sanitized data"""
-        try:
-            access_token = self.sf_auth.get_access_token()
-            if not access_token:
-                return None
-            
-            headers = {
-                'Authorization': f'Bearer {access_token}',
-                'Content-Type': 'application/json'
-            }
-            
-            # 1. CREATE CHANNEL USER
-            channel_user_url = f"{SF_INSTANCE_URL}/services/data/v58.0/sobjects/Channel_User__c/"
-            
-            # Sanitize inputs for name
-            safe_first_name = re.sub(r'[^\w\s\-]', '', first_name or '')[:40]
-            safe_last_name = re.sub(r'[^\w\s\-]', '', last_name or '')[:40]
-            
-            # Generate a name for the channel user
-            if safe_first_name and safe_last_name:
-                name = f'Telegram: {safe_first_name} {safe_last_name}'
-            elif phone:
-                name = f'Telegram: {phone}'
-            else:
-                name = f'Telegram: {telegram_id}'
-            
-            # Truncate name if too long
-            name = name[:80]
-            
-            channel_user_data = {
-                'Channel_Type__c': 'Telegram',
-                'Channel_ID__c': f'telegram_{telegram_id}'[:80],
-                'Telegram_Chat_ID__c': str(telegram_id),
-                'Name': name,
-                'Created_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
-                'Last_Activity_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
-            }
-            
-            # Add contact relationship if available and valid
-            if contact_id and re.match(r'^[a-zA-Z0-9]{15,18}$', contact_id):
-                channel_user_data['Contact__c'] = contact_id
-            
-            logger.info(f"Creating Channel User for {telegram_id}")
-            response = requests.post(channel_user_url, headers=headers, json=channel_user_data, timeout=30)
-            
-            if response.status_code != 201:
-                logger.error(f"Failed to create Channel_User__c: {response.status_code}")
-                return None
-            
-            channel_user_result = response.json()
-            channel_user_id = channel_user_result['id']
-            logger.info(f"Created Channel_User__c: {channel_user_id}")
-            
-            # 2. CREATE SUPPORT CONVERSATION (Active state)
-            conversation_url = f"{SF_INSTANCE_URL}/services/data/v58.0/sobjects/Support_Conversation__c/"
-            
-            conversation_data = {
-                'Channel_User_Name__c': channel_user_id,
-                'Status__c': 'Active',
-                'Created_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
-                'Last_Activity_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
-                'Last_Message_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
-            }
-            
-            logger.info(f"Creating Support Conversation for Channel User {channel_user_id}")
-            response = requests.post(conversation_url, headers=headers, json=conversation_data, timeout=30)
-            
-            if response.status_code != 201:
-                logger.error(f"Failed to create Support_Conversation__c: {response.status_code}")
-                # Channel user was created, but conversation failed - return channel user ID only
-                return {'channelUserId': channel_user_id, 'conversationId': None}
-            
-            conversation_result = response.json()
-            conversation_id = conversation_result['id']
-            logger.info(f"Created Support_Conversation__c: {conversation_id}")
-            
-            # 3. UPDATE CONTACT WITH TELEGRAM ID (if contact exists and valid)
-            if contact_id and re.match(r'^[a-zA-Z0-9]{15,18}$', contact_id):
-                self.update_contact_telegram_id(contact_id, telegram_id)
-            
-            return {
-                'channelUserId': channel_user_id,
-                'conversationId': conversation_id
-            }
-                
-        except Exception as e:
-            logger.error(f"Error creating channel user with conversation: {e}")
+   def create_channel_user_with_conversation(self, telegram_id, phone=None, contact_id=None, first_name=None, last_name=None, user_phone=None):
+    """Create Channel_User__c AND Support_Conversation__c together with sanitized data"""
+    try:
+        access_token = self.sf_auth.get_access_token()
+        if not access_token:
             return None
+        
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        # 1. CREATE CHANNEL USER
+        channel_user_url = f"{SF_INSTANCE_URL}/services/data/v58.0/sobjects/Channel_User__c/"
+        
+        # Sanitize inputs for name
+        safe_first_name = re.sub(r'[^\w\s\-]', '', first_name or '')[:40]
+        safe_last_name = re.sub(r'[^\w\s\-]', '', last_name or '')[:40]
+        
+        # Generate name from first and last name
+        if safe_first_name and safe_last_name:
+            name = f'{safe_first_name} {safe_last_name}'
+        elif safe_first_name:
+            name = safe_first_name
+        elif safe_last_name:
+            name = safe_last_name
+        elif phone:
+            name = f'User {phone}'
+        else:
+            name = f'Telegram User {telegram_id}'
+        
+        # Truncate name if too long
+        name = name[:80]
+        
+        channel_user_data = {
+            'Channel_Type__c': 'Telegram',
+            'Channel_ID__c': f'telegram_{telegram_id}'[:80],
+            'Telegram_Chat_ID__c': str(telegram_id),
+            'Name': name,
+            'Created_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
+            'Last_Activity_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
+        }
+        
+        # Add Mobile_Number__c field if phone is provided
+        if user_phone:
+            channel_user_data['Mobile_Number__c'] = user_phone
+        
+        # Add contact relationship if available and valid
+        if contact_id and re.match(r'^[a-zA-Z0-9]{15,18}$', contact_id):
+            channel_user_data['Contact__c'] = contact_id
+        
+        logger.info(f"Creating Channel User for {telegram_id} with name: {name}, phone: {user_phone}")
+        response = requests.post(channel_user_url, headers=headers, json=channel_user_data, timeout=30)
+        
+        if response.status_code != 201:
+            logger.error(f"Failed to create Channel_User__c: {response.status_code}")
+            return None
+        
+        channel_user_result = response.json()
+        channel_user_id = channel_user_result['id']
+        logger.info(f"Created Channel_User__c: {channel_user_id}")
+        
+        # 2. CREATE SUPPORT CONVERSATION (Active state)
+        conversation_url = f"{SF_INSTANCE_URL}/services/data/v58.0/sobjects/Support_Conversation__c/"
+        
+        conversation_data = {
+            'Channel_User_Name__c': channel_user_id,
+            'Status__c': 'Active',
+            'Created_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
+            'Last_Activity_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
+            'Last_Message_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
+        }
+        
+        logger.info(f"Creating Support Conversation for Channel User {channel_user_id}")
+        response = requests.post(conversation_url, headers=headers, json=conversation_data, timeout=30)
+        
+        if response.status_code != 201:
+            logger.error(f"Failed to create Support_Conversation__c: {response.status_code}")
+            # Channel user was created, but conversation failed - return channel user ID only
+            return {'channelUserId': channel_user_id, 'conversationId': None}
+        
+        conversation_result = response.json()
+        conversation_id = conversation_result['id']
+        logger.info(f"Created Support_Conversation__c: {conversation_id}")
+        
+        # 3. UPDATE CONTACT WITH TELEGRAM ID (if contact exists and valid)
+        if contact_id and re.match(r'^[a-zA-Z0-9]{15,18}$', contact_id):
+            self.update_contact_telegram_id(contact_id, telegram_id)
+        
+        return {
+            'channelUserId': channel_user_id,
+            'conversationId': conversation_id
+        }
+            
+    except Exception as e:
+        logger.error(f"Error creating channel user with conversation: {e}")
+        return None
     
     def link_channel_user_to_contact(self, channel_user_id, contact_id):
         """Link existing Channel_User__c to Contact"""
@@ -1320,6 +1328,8 @@ def send_message_confirmation(chat_id, success, is_session_start=False, queue_po
 
 # In-memory storage for user session state
 user_session_state = {}
+# In-memory storage for registration flow state
+registration_flow = {}
 
 #///////////////////////////////
 def handle_callback_query(callback_query):
@@ -1424,15 +1434,18 @@ Do you want to end the current session and start a new one?
 
 def handle_new_user_registration_callback(chat_id, callback_data, user_data):
     """Handle callback queries for new users"""
+    chat_id_str = str(chat_id)
+    
     if callback_data == 'register_phone':
+        # Set registration state to expect phone number
+        registration_flow[chat_id_str] = {'step': 'phone_requested'}
+        
         welcome_text = """
 👋 *Welcome to Bank of Abyssinia Support!*
 
-To get started with our support services, we need to register you in our system.
+To get started, please share your *phone number*:
 
-Please share your *phone number* to begin:
-
-Example: *0912121212*
+Example: *0912121212* or *+251912121212*
         """
         bot_manager.send_message(chat_id, welcome_text, parse_mode='Markdown')
     return True
@@ -1460,10 +1473,15 @@ def process_incoming_message(chat_id, message_text, user_data):
         
         # STEP 1: Check if Channel_User__c exists
         channel_user = bot_manager.check_existing_channel_user(chat_id_str)
-        
+
         if not channel_user:
-            # Handle registration flow
-            return handle_new_user_registration(chat_id, safe_message, user_data)
+            # Check if user is in registration flow
+            if chat_id_str in registration_flow:
+                # Handle registration flow
+                return handle_new_user_registration(chat_id, safe_message, user_data)
+            else:
+                # Start new registration
+                return handle_new_user_registration(chat_id, safe_message, user_data)
         
         # ✅ Channel User EXISTS
         logger.info(f"Existing Channel User found: {channel_user['Id']}")
@@ -1705,7 +1723,13 @@ def handle_new_user_registration(chat_id, message_text, user_data):
     chat_id_str = str(chat_id)
     message_lower = message_text.strip().lower()
     
-    if message_lower == '/start':
+    # Check if user is in registration flow
+    registration_state = registration_flow.get(chat_id_str, {})
+    
+    if message_lower == '/start' or not registration_state:
+        # Reset registration state and show initial registration button
+        registration_flow[chat_id_str] = {'step': 'start'}
+        
         # Use buttons for new users
         keyboard = {
             "inline_keyboard": [
@@ -1723,7 +1747,10 @@ To get started with our support services, we need to register you in our system.
                                parse_mode='Markdown')
         return True
     
-    elif is_phone_number(message_text):
+    # Handle registration flow steps
+    current_step = registration_state.get('step')
+    
+    if current_step == 'phone_requested' and is_phone_number(message_text):
         clean_phone = bot_manager.clean_phone_number(message_text)
         
         if not clean_phone:
@@ -1734,20 +1761,59 @@ Example: *0912121212* or *+251912121212*
             """
             return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
         
-        logger.info(f"Creating Channel User and Conversation for {chat_id} with phone: {clean_phone}")
+        # Store phone and ask for name
+        registration_flow[chat_id_str] = {
+            'step': 'name_requested',
+            'phone': clean_phone
+        }
+        
+        name_request_text = """
+✅ *Phone number received!*
+
+Now, please enter your *first and last name*:
+
+Example: *John Smith*
+        """
+        return bot_manager.send_message(chat_id, name_request_text, parse_mode='Markdown')
+    
+    elif current_step == 'name_requested':
+        # Validate name format
+        name_parts = message_text.strip().split()
+        if len(name_parts) < 2:
+            error_text = """
+📝 *Please enter both first and last name:*
+
+Example: *John Smith*
+            """
+            return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
+        
+        first_name = name_parts[0].strip()
+        last_name = ' '.join(name_parts[1:]).strip()
+        
+        # Clean names (remove special characters, limit length)
+        safe_first_name = re.sub(r'[^\w\s\-]', '', first_name)[:40]
+        safe_last_name = re.sub(r'[^\w\s\-]', '', last_name)[:40]
+        
+        phone = registration_state.get('phone')
+        
+        logger.info(f"Creating Channel User and Conversation for {chat_id} with name: {safe_first_name} {safe_last_name}, phone: {phone}")
         
         # Check if Contact exists with this phone
-        contact = bot_manager.find_contact_by_phone(clean_phone)
+        contact = bot_manager.find_contact_by_phone(phone)
         contact_id = contact['Id'] if contact else None
         
         # Create Channel User AND Support Conversation together
         result = bot_manager.create_channel_user_with_conversation(
             telegram_id=chat_id_str,
-            phone=clean_phone,
+            phone=phone,
             contact_id=contact_id,
-            first_name=user_data.get('first_name'),
-            last_name=user_data.get('last_name')
+            first_name=safe_first_name,
+            last_name=safe_last_name,
+            user_phone=phone  # Pass phone for Mobile_Number__c field
         )
+        
+        # Clear registration flow
+        registration_flow.pop(chat_id_str, None)
         
         if not result:
             error_text = "❌ *Sorry, there was an error creating your account. Please try again.*"
@@ -1762,27 +1828,34 @@ Example: *0912121212* or *+251912121212*
 You're now registered in our support system.
             """
         else:
-            welcome_text = """
+            welcome_text = f"""
 ✅ *Registration Successful!*
 
-You're now connected to our support system.
+Welcome *{safe_first_name} {safe_last_name}*, you're now connected to our support system.
             """
         
         bot_manager.send_message(chat_id, welcome_text, parse_mode='Markdown')
         
         # Show main menu (no active session for new users)
-        return show_main_menu(chat_id, contact.get('FirstName') if contact else None, has_active_session=False)
+        return show_main_menu(chat_id, safe_first_name, has_active_session=False)
     
-    else:
-        # User didn't provide phone number
+    elif current_step == 'phone_requested' and not is_phone_number(message_text):
+        # Invalid phone number
         error_text = """
 📱 *Please enter a valid Ethiopian phone number:*
 
 Example: *0912121212* or *+251912121212*
-
-Or type */start* to see the welcome message.
         """
         return bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
+    
+    elif current_step == 'start':
+        # This should have been handled by button
+        return True
+    
+    else:
+        # Unexpected state, reset
+        registration_flow.pop(chat_id_str, None)
+        return handle_new_user_registration(chat_id, message_text, user_data)
 
 # ============================================
 # SECURE FLASK ROUTES
