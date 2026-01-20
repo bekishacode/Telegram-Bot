@@ -1433,7 +1433,7 @@ Do you want to end the current session and start a new one?
 
 
 def handle_new_user_registration_callback(chat_id, callback_data, user_data):
-    """Handle callback queries for new users"""
+    """Handle callback queries for new users - FIXED VERSION"""
     chat_id_str = str(chat_id)
     
     if callback_data == 'register_phone':
@@ -1444,37 +1444,24 @@ def handle_new_user_registration_callback(chat_id, callback_data, user_data):
             user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
             return show_main_menu(chat_id, user_name, has_active_session=False)
         
-        # Check if user is already in registration flow
+        # Check registration flow state
         if chat_id_str in registration_flow:
             current_state = registration_flow[chat_id_str]
             current_step = current_state.get('step')
             
             if current_step == 'phone_requested':
-                # Already asked for phone, remind them
-                reminder_text = """
-📱 *We're waiting for your phone number.*
-
-Please enter your phone number:
-
-Example: *0912121212* or *+251912121212*
-                """
-                bot_manager.send_message(chat_id, reminder_text, parse_mode='Markdown')
+                # Already asked for phone - DO NOT send duplicate message
+                # Just acknowledge the callback query
                 return True
             elif current_step == 'name_requested':
-                # Already asked for name, remind them
-                reminder_text = """
-📝 *We're waiting for your name.*
-
-Please enter your first and last name:
-
-Example: *John Smith*
-                """
-                bot_manager.send_message(chat_id, reminder_text, parse_mode='Markdown')
+                # Already asked for name - DO NOT send duplicate message
+                # Just acknowledge the callback query
                 return True
         
         # Set registration state to expect phone number
         registration_flow[chat_id_str] = {'step': 'phone_requested'}
         
+        # Send ONLY ONE message asking for phone number
         welcome_text = """
 👋 *Welcome to Bank of Abyssinia Support!*
 
@@ -1482,7 +1469,8 @@ To get started, please share your *phone number*:
 
 Example: *0912121212* or *+251912121212*
         """
-        bot_manager.send_message(chat_id, welcome_text, parse_mode='Markdown')
+        return bot_manager.send_message(chat_id, welcome_text, parse_mode='Markdown')
+    
     return True
 #///////////////////////////////
 
@@ -1802,21 +1790,149 @@ def handle_message_without_session(chat_id, message_text, user_data, channel_use
         logger.info(f"No active session for user {chat_id}, showing menu with buttons")
         user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
         return show_main_menu(chat_id, user_name, has_active_session=False)
+#################################
+def handle_callback_query(callback_query):
+    """Handle inline keyboard button presses - UPDATED"""
+    try:
+        chat_id = callback_query['message']['chat']['id']
+        callback_data = callback_query['data']
+        message_id = callback_query['message']['message_id']
+        
+        # Acknowledge callback query (removes loading state)
+        bot_manager.answer_callback_query(callback_query['id'])
+        
+        # Get user data from callback query
+        user_data = callback_query.get('from', {})
+        
+        logger.info(f"Callback query from {chat_id}: {callback_data}")
+        
+        # Remove the buttons from the message that was clicked
+        bot_manager.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
+        
+        # Check if Channel_User__c exists
+        channel_user = bot_manager.check_existing_channel_user(str(chat_id))
+        
+        if not channel_user:
+            # Handle registration for new users
+            return handle_new_user_registration_callback(chat_id, callback_data, user_data)
+        
+        # Get conversation for existing users
+        conversation = bot_manager.get_active_support_conversation(channel_user['Id'])
+        if not conversation:
+            error_text = "❌ Sorry, we couldn't find your conversation."
+            bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
+            return False
+        
+        conversation_id = conversation['Id']
+        
+        # Handle different callback actions
+        if callback_data == 'contact_support':
+            success, session_id = handle_contact_support(
+                chat_id, 
+                channel_user['Id'],
+                conversation_id,
+                user_data
+            )
+            if success and session_id:
+                user_session_state[str(chat_id)] = {
+                    'in_session': True,
+                    'conversation_id': conversation_id,
+                    'session_id': session_id,
+                    'session_status': 'Waiting'
+                }
+            return success
+            
+        elif callback_data == 'track_case':
+            return handle_track_case(chat_id)
+            
+        elif callback_data == 'new_session':
+            # Option to start fresh session even if one exists
+            active_sessions = bot_manager.get_active_sessions(conversation_id)
+            if active_sessions:
+                confirm_keyboard = {
+                    "inline_keyboard": [
+                        [{"text": "✅ Yes", "callback_data": "confirm_new_session"}],
+                        [{"text": "❌ No", "callback_data": "cancel_new_session"}]
+                    ]
+                }
+                confirm_text = """
+⚠️ *You already have an active support session.*
+
+Do you want to end the current session and start a new one?
+                """
+                bot_manager.send_message(chat_id, confirm_text, 
+                                       reply_markup=confirm_keyboard, 
+                                       parse_mode='Markdown')
+                return True
+            else:
+                return handle_contact_support(chat_id, channel_user['Id'], conversation_id, user_data)
+                
+        elif callback_data == 'continue_session':
+            return handle_continue_session(chat_id, conversation_id)
+            
+        elif callback_data == 'main_menu':
+            user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
+            active_sessions = bot_manager.get_active_sessions(conversation_id)
+            has_active_session = len(active_sessions) > 0
+            return show_main_menu(chat_id, user_name, has_active_session)
+            
+        elif callback_data == 'confirm_new_session':
+            # Logic to close current session would go here
+            user_session_state[str(chat_id)] = {}
+            return handle_contact_support(chat_id, channel_user['Id'], conversation_id, user_data)
+            
+        elif callback_data == 'cancel_new_session':
+            return handle_continue_session(chat_id, conversation_id)
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Callback query error: {e}")
+        return False
+#################################
 
 def handle_new_user_registration(chat_id, message_text, user_data):
-    """Handle new user registration - SIMPLIFIED VERSION"""
+    """Handle new user registration - IMPROVED VERSION"""
     chat_id_str = str(chat_id)
     message_lower = message_text.strip().lower()
     
     # Get registration state
     registration_state = registration_flow.get(chat_id_str, {})
-    current_step = registration_state.get('step')
     
-    # If no registration state, show registration button
+    # If no registration state, check if this is a fresh start
     if not registration_state:
+        # Check if user is already registered
+        channel_user = bot_manager.check_existing_channel_user(chat_id_str)
+        if channel_user:
+            # User is already registered, show main menu
+            user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
+            return show_main_menu(chat_id, user_name, has_active_session=False)
+        
+        # If user sent a phone number directly (without clicking button)
+        if is_phone_number(message_text):
+            clean_phone = bot_manager.clean_phone_number(message_text)
+            if clean_phone:
+                # Store phone and ask for name
+                registration_flow[chat_id_str] = {
+                    'step': 'name_requested',
+                    'phone': clean_phone
+                }
+                
+                name_request_text = """
+✅ *Phone number received!*
+
+Now, please enter your *first and last name*:
+
+Example: *John Smith*
+                """
+                return bot_manager.send_message(chat_id, name_request_text, parse_mode='Markdown')
+        
+        # Otherwise, show registration button
         return show_registration_button(chat_id)
     
     # Handle registration flow steps
+    current_step = registration_state.get('step')
+    
     if current_step == 'phone_requested':
         if is_phone_number(message_text):
             clean_phone = bot_manager.clean_phone_number(message_text)
@@ -1888,7 +2004,7 @@ Example: *John Smith*
             user_phone=phone
         )
         
-        # Clear registration flow
+        # Clear registration flow IMMEDIATELY after success
         registration_flow.pop(chat_id_str, None)
         
         if not result:
