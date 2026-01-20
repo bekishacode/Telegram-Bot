@@ -749,104 +749,104 @@ class TelegramBotManager:
             logger.error(f"Error getting active sessions: {e}")
             return []
     
-   def create_channel_user_with_conversation(self, telegram_id, phone=None, contact_id=None, first_name=None, last_name=None, user_phone=None):
-        """Create Channel_User__c AND Support_Conversation__c together with sanitized data"""
-        try:
-            access_token = self.sf_auth.get_access_token()
-            if not access_token:
-                return None
-            
-            headers = {
-                'Authorization': f'Bearer {access_token}',
-                'Content-Type': 'application/json'
-            }
-            
-            # 1. CREATE CHANNEL USER
-            channel_user_url = f"{SF_INSTANCE_URL}/services/data/v58.0/sobjects/Channel_User__c/"
-            
-            # Sanitize inputs for name
-            safe_first_name = re.sub(r'[^\w\s\-]', '', first_name or '')[:40]
-            safe_last_name = re.sub(r'[^\w\s\-]', '', last_name or '')[:40]
-            
-            # Generate name from first and last name
-            if safe_first_name and safe_last_name:
-                name = f'{safe_first_name} {safe_last_name}'
-            elif safe_first_name:
-                name = safe_first_name
-            elif safe_last_name:
-                name = safe_last_name
-            elif phone:
-                name = f'User {phone}'
-            else:
-                name = f'Telegram User {telegram_id}'
-            
-            # Truncate name if too long
-            name = name[:80]
-            
-            channel_user_data = {
-                'Channel_Type__c': 'Telegram',
-                'Channel_ID__c': f'telegram_{telegram_id}'[:80],
-                'Telegram_Chat_ID__c': str(telegram_id),
-                'Name': name,
-                'Created_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
-                'Last_Activity_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
-            }
-            
-            # Add Mobile_Number__c field if phone is provided
-            if user_phone:
-                channel_user_data['Mobile_Number__c'] = user_phone
-            
-            # Add contact relationship if available and valid
-            if contact_id and re.match(r'^[a-zA-Z0-9]{15,18}$', contact_id):
-                channel_user_data['Contact__c'] = contact_id
-            
-            logger.info(f"Creating Channel User for {telegram_id} with name: {name}, phone: {user_phone}")
-            response = requests.post(channel_user_url, headers=headers, json=channel_user_data, timeout=30)
-            
-            if response.status_code != 201:
-                logger.error(f"Failed to create Channel_User__c: {response.status_code}")
-                return None
-            
-            channel_user_result = response.json()
-            channel_user_id = channel_user_result['id']
-            logger.info(f"Created Channel_User__c: {channel_user_id}")
-            
-            # 2. CREATE SUPPORT CONVERSATION (Active state)
-            conversation_url = f"{SF_INSTANCE_URL}/services/data/v58.0/sobjects/Support_Conversation__c/"
-            
-            conversation_data = {
-                'Channel_User_Name__c': channel_user_id,
-                'Status__c': 'Active',
-                'Created_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
-                'Last_Activity_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
-                'Last_Message_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
-            }
-            
-            logger.info(f"Creating Support Conversation for Channel User {channel_user_id}")
-            response = requests.post(conversation_url, headers=headers, json=conversation_data, timeout=30)
-            
-            if response.status_code != 201:
-                logger.error(f"Failed to create Support_Conversation__c: {response.status_code}")
-                # Channel user was created, but conversation failed - return channel user ID only
-                return {'channelUserId': channel_user_id, 'conversationId': None}
-            
-            conversation_result = response.json()
-            conversation_id = conversation_result['id']
-            logger.info(f"Created Support_Conversation__c: {conversation_id}")
-            
-            # 3. UPDATE CONTACT WITH TELEGRAM ID (if contact exists and valid)
-            if contact_id and re.match(r'^[a-zA-Z0-9]{15,18}$', contact_id):
-                self.update_contact_telegram_id(contact_id, telegram_id)
-            
-            return {
-                'channelUserId': channel_user_id,
-                'conversationId': conversation_id
-            }
+    def create_channel_user_with_conversation(self, telegram_id, phone=None, contact_id=None, first_name=None, last_name=None, user_phone=None):
+            """Create Channel_User__c AND Support_Conversation__c together with sanitized data"""
+            try:
+                access_token = self.sf_auth.get_access_token()
+                if not access_token:
+                    return None
                 
-        except Exception as e:
-            logger.error(f"Error creating channel user with conversation: {e}")
-            return None
-    
+                headers = {
+                    'Authorization': f'Bearer {access_token}',
+                    'Content-Type': 'application/json'
+                }
+                
+                # 1. CREATE CHANNEL USER
+                channel_user_url = f"{SF_INSTANCE_URL}/services/data/v58.0/sobjects/Channel_User__c/"
+                
+                # Sanitize inputs for name
+                safe_first_name = re.sub(r'[^\w\s\-]', '', first_name or '')[:40]
+                safe_last_name = re.sub(r'[^\w\s\-]', '', last_name or '')[:40]
+                
+                # Generate name from first and last name
+                if safe_first_name and safe_last_name:
+                    name = f'{safe_first_name} {safe_last_name}'
+                elif safe_first_name:
+                    name = safe_first_name
+                elif safe_last_name:
+                    name = safe_last_name
+                elif phone:
+                    name = f'User {phone}'
+                else:
+                    name = f'Telegram User {telegram_id}'
+                
+                # Truncate name if too long
+                name = name[:80]
+                
+                channel_user_data = {
+                    'Channel_Type__c': 'Telegram',
+                    'Channel_ID__c': f'telegram_{telegram_id}'[:80],
+                    'Telegram_Chat_ID__c': str(telegram_id),
+                    'Name': name,
+                    'Created_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
+                    'Last_Activity_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
+                }
+                
+                # Add Mobile_Number__c field if phone is provided
+                if user_phone:
+                    channel_user_data['Mobile_Number__c'] = user_phone
+                
+                # Add contact relationship if available and valid
+                if contact_id and re.match(r'^[a-zA-Z0-9]{15,18}$', contact_id):
+                    channel_user_data['Contact__c'] = contact_id
+                
+                logger.info(f"Creating Channel User for {telegram_id} with name: {name}, phone: {user_phone}")
+                response = requests.post(channel_user_url, headers=headers, json=channel_user_data, timeout=30)
+                
+                if response.status_code != 201:
+                    logger.error(f"Failed to create Channel_User__c: {response.status_code}")
+                    return None
+                
+                channel_user_result = response.json()
+                channel_user_id = channel_user_result['id']
+                logger.info(f"Created Channel_User__c: {channel_user_id}")
+                
+                # 2. CREATE SUPPORT CONVERSATION (Active state)
+                conversation_url = f"{SF_INSTANCE_URL}/services/data/v58.0/sobjects/Support_Conversation__c/"
+                
+                conversation_data = {
+                    'Channel_User_Name__c': channel_user_id,
+                    'Status__c': 'Active',
+                    'Created_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
+                    'Last_Activity_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
+                    'Last_Message_Date__c': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
+                }
+                
+                logger.info(f"Creating Support Conversation for Channel User {channel_user_id}")
+                response = requests.post(conversation_url, headers=headers, json=conversation_data, timeout=30)
+                
+                if response.status_code != 201:
+                    logger.error(f"Failed to create Support_Conversation__c: {response.status_code}")
+                    # Channel user was created, but conversation failed - return channel user ID only
+                    return {'channelUserId': channel_user_id, 'conversationId': None}
+                
+                conversation_result = response.json()
+                conversation_id = conversation_result['id']
+                logger.info(f"Created Support_Conversation__c: {conversation_id}")
+                
+                # 3. UPDATE CONTACT WITH TELEGRAM ID (if contact exists and valid)
+                if contact_id and re.match(r'^[a-zA-Z0-9]{15,18}$', contact_id):
+                    self.update_contact_telegram_id(contact_id, telegram_id)
+                
+                return {
+                    'channelUserId': channel_user_id,
+                    'conversationId': conversation_id
+                }
+                    
+            except Exception as e:
+                logger.error(f"Error creating channel user with conversation: {e}")
+                return None
+        
     def link_channel_user_to_contact(self, channel_user_id, contact_id):
         """Link existing Channel_User__c to Contact"""
         try:
