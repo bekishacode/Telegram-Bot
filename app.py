@@ -1053,48 +1053,29 @@ def is_menu_command(text):
     menu_commands = ['/start', 'hi', 'hello', 'hey', 'menu', 'help']
     return text.strip().lower() in menu_commands
 
-def show_main_menu(chat_id, user_name=None, has_active_session=False):
-    """Show main menu with inline keyboard buttons"""
+def show_main_menu(chat_id, user_name=None):
+    """Show main menu with inline keyboard buttons - NO CONTINUE OPTION"""
     
-    # Create appropriate keyboard based on session state
-    if has_active_session:
-        keyboard = [
-            [{"text": "🔄 Continue Support Session", "callback_data": "continue_session"}],
-            [{"text": "📋 Track your Case", "callback_data": "track_case"}],
-            [{"text": "➕ New Support Request", "callback_data": "new_session"}],
-            [{"text": "🏠 Main Menu", "callback_data": "main_menu"}]
-        ]
-        
-        menu_text = f"""
-🔔 *You have an active support session*
-
-*Choose an option:*
-
-🔄 *Continue Support Session* - Go back to your active support conversation
-📋 *Track your Case* - Check status of existing cases  
-➕ *New Support Request* - Start a new support session
-🏠 *Main Menu* - See all options
-        """
-    else:
-        welcome_text = "👋 *Welcome to Bank of Abyssinia Support!*"
-        if user_name:
-            safe_name = re.sub(r'[^\w\s\-]', '', user_name)[:30]
-            welcome_text = f"👋 *Welcome back, {safe_name}!*"
-        
-        keyboard = [
-            [{"text": "👥 Contact Customer Support", "callback_data": "contact_support"}],
-            [{"text": "📋 Track your Case", "callback_data": "track_case"}],
-            [{"text": "🏠 Main Menu", "callback_data": "main_menu"}]
-        ]
-        
-        menu_text = f"""
+    welcome_text = "👋 *Welcome to Bank of Abyssinia Support!*"
+    if user_name:
+        safe_name = re.sub(r'[^\w\s\-]', '', user_name)[:30]
+        welcome_text = f"👋 *Welcome back, {safe_name}!*"
+    
+    keyboard = [
+        [{"text": "👥 Contact Customer Support", "callback_data": "contact_support"}],
+        [{"text": "📋 Track your Case", "callback_data": "track_case"}],
+        [{"text": "🏠 Main Menu", "callback_data": "main_menu"}]
+    ]
+    
+    menu_text = f"""
 {welcome_text}
 
 *Choose an option:*
 
 👥 *Contact Customer Support* - Connect with our support team
 📋 *Track your Case* - Check status of existing cases
-        """
+🏠 *Main Menu* - Refresh this menu
+    """
     
     reply_markup = {
         "inline_keyboard": keyboard,
@@ -1105,7 +1086,7 @@ def show_main_menu(chat_id, user_name=None, has_active_session=False):
     return bot_manager.send_message(chat_id, menu_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 def handle_contact_support(chat_id, channel_user_id, conversation_id, user_data):
-    """Handle Contact Customer Support option - UPDATED for seamless flow"""
+    """Handle Contact Customer Support option - WITH QUEUE POSITION"""
     try:
         # Show typing indicator
         bot_manager.send_typing_action(chat_id)
@@ -1119,14 +1100,14 @@ Please try again or contact support through other channels.
             bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
             return False, None
         
-        # Check for existing active sessions
+        # Check for existing sessions
         active_sessions = bot_manager.get_active_sessions(conversation_id)
         
         if active_sessions:
-            # Active session exists
+            # Session exists (waiting or active), return it
             session = active_sessions[0]
             session_id = session.get('Id')
-            session_status = session.get('Status__c', 'Unknown')
+            session_status = session.get('Status__c', 'Waiting')
             
             # Update user session state
             user_session_state[str(chat_id)] = {
@@ -1136,6 +1117,7 @@ Please try again or contact support through other channels.
                 'session_status': session_status
             }
             
+            # Send appropriate message based on status
             if session_status == 'Active':
                 response_text = """
 ✅ *You have an active support session!*
@@ -1143,7 +1125,7 @@ Please try again or contact support through other channels.
 You're currently connected with an agent. Please continue your conversation.
                 """
             else:
-                # Session is waiting in queue
+                # For waiting sessions, show queue position
                 queue_position = bot_manager.get_queue_position(conversation_id)
                 if queue_position:
                     response_text = f"""
@@ -1204,7 +1186,7 @@ Please wait a moment and send your message again.
                 'session_status': 'Waiting'
             }
             
-            # Get queue position
+            # Get queue position for new session
             queue_position = bot_manager.get_queue_position(conversation_id)
             
             if queue_position:
@@ -1212,16 +1194,12 @@ Please wait a moment and send your message again.
 ✅ *Support session created!*
 
 You are now *#{queue_position} in the queue*. An agent will be with you shortly.
-
-Please describe your issue or question when you're ready.
                 """
             else:
                 response_text = """
 ✅ *Support session created!*
 
 You are now in the queue. An agent will be with you shortly.
-
-Please describe your issue or question when you're ready.
                 """
             
             bot_manager.send_message(chat_id, response_text, parse_mode='Markdown')
@@ -1242,52 +1220,6 @@ This feature is coming soon! We're working on allowing you to track your support
 
 For now, please contact customer support for case updates.
     """
-    return bot_manager.send_message(chat_id, response_text, parse_mode='Markdown')
-
-def handle_continue_session(chat_id, conversation_id):
-    """Handle Continue Support Session option"""
-    active_sessions = bot_manager.get_active_sessions(conversation_id)
-    
-    if not active_sessions:
-        response_text = """
-ℹ️ *You don't have an active support session.*
-
-Please start a new support session using option 1.
-        """
-    else:
-        session = active_sessions[0]
-        session_id = session.get('Id')
-        session_status = session.get('Status__c', 'Unknown')
-        
-        # Update user session state
-        user_session_state[str(chat_id)] = {
-            'in_session': True,
-            'conversation_id': conversation_id,
-            'session_id': session_id,
-            'session_status': session_status
-        }
-        
-        if session_status == 'Active':
-            response_text = """
-✅ *Returning to your support session...*
-
-You're connected with an agent. Please continue your conversation.
-            """
-        else:
-            queue_position = bot_manager.get_queue_position(conversation_id)
-            if queue_position:
-                response_text = f"""
-⏳ *Returning to your support request...*
-
-You're *#{queue_position} in the queue*. Please wait for an agent.
-                """
-            else:
-                response_text = """
-⏳ *Returning to your support request...*
-
-You're still in the queue. An agent will join shortly.
-                """
-    
     return bot_manager.send_message(chat_id, response_text, parse_mode='Markdown')
 
 def send_message_confirmation(chat_id, success, is_session_start=False, queue_position=None):
@@ -1333,7 +1265,7 @@ registration_flow = {}
 
 #///////////////////////////////
 def handle_callback_query(callback_query):
-    """Handle inline keyboard button presses"""
+    """Handle inline keyboard button presses - UPDATED VERSION"""
     try:
         chat_id = callback_query['message']['chat']['id']
         callback_data = callback_query['data']
@@ -1346,6 +1278,9 @@ def handle_callback_query(callback_query):
         user_data = callback_query.get('from', {})
         
         logger.info(f"Callback query from {chat_id}: {callback_data}")
+        
+        # Remove the buttons from the message that was clicked
+        bot_manager.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
         
         # Check if Channel_User__c exists
         channel_user = bot_manager.check_existing_channel_user(str(chat_id))
@@ -1384,46 +1319,69 @@ def handle_callback_query(callback_query):
             return handle_track_case(chat_id)
             
         elif callback_data == 'new_session':
-            # Option to start fresh session even if one exists
+            # User wants a new session - just create it
+            return handle_contact_support(chat_id, channel_user['Id'], conversation_id, user_data)
+            
+        elif callback_data == 'continue_session':
+            # REMOVED - We don't have "Continue Support Session" anymore
+            # Instead, check if there's a session and forward to it, or show menu
             active_sessions = bot_manager.get_active_sessions(conversation_id)
             if active_sessions:
-                confirm_keyboard = {
-                    "inline_keyboard": [
-                        [{"text": "✅ Yes", "callback_data": "confirm_new_session"}],
-                        [{"text": "❌ No", "callback_data": "cancel_new_session"}]
-                    ]
-                }
-                confirm_text = """
-⚠️ *You already have an active support session.*
-
-Do you want to end the current session and start a new one?
-                """
-                bot_manager.send_message(chat_id, confirm_text, 
-                                       reply_markup=confirm_keyboard, 
-                                       parse_mode='Markdown')
-                return True
-            else:
-                return handle_contact_support(chat_id, channel_user['Id'], conversation_id, user_data)
+                # There's a session, show appropriate message
+                session = active_sessions[0]
+                session_status = session.get('Status__c', 'Waiting')
                 
-        elif callback_data == 'continue_session':
-            return handle_continue_session(chat_id, conversation_id)
+                if session_status == 'Active':
+                    response_text = """
+✅ *You have an active support session!*
+
+You're currently connected with an agent. Please continue your conversation.
+                    """
+                else:
+                    queue_position = bot_manager.get_queue_position(conversation_id)
+                    if queue_position:
+                        response_text = f"""
+⏳ *You're #{queue_position} in the queue.*
+
+Please wait for an agent to join. You can describe your issue now.
+                        """
+                    else:
+                        response_text = """
+⏳ *Your support request is in the queue.*
+
+Please wait for an agent to join. You can describe your issue now.
+                        """
+                
+                bot_manager.send_message(chat_id, response_text, parse_mode='Markdown')
+                
+                # Update session state
+                user_session_state[str(chat_id)] = {
+                    'in_session': True,
+                    'conversation_id': conversation_id,
+                    'session_id': session.get('Id'),
+                    'session_status': session_status
+                }
+            else:
+                # No session, show main menu
+                user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
+                return show_main_menu(chat_id, user_name)
+            return True
             
         elif callback_data == 'main_menu':
             user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
-            active_sessions = bot_manager.get_active_sessions(conversation_id)
-            has_active_session = len(active_sessions) > 0
-            return show_main_menu(chat_id, user_name, has_active_session)
+            return show_main_menu(chat_id, user_name)
             
         elif callback_data == 'confirm_new_session':
-            # Logic to close current session would go here
+            # User confirmed they want new session
             user_session_state[str(chat_id)] = {}
             return handle_contact_support(chat_id, channel_user['Id'], conversation_id, user_data)
             
         elif callback_data == 'cancel_new_session':
-            return handle_continue_session(chat_id, conversation_id)
-        
-        # Edit the original message to remove buttons after selection
-        bot_manager.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
+            # User cancelled new session request
+            user_session_state[str(chat_id)] = {}
+            # Show main menu
+            user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
+            return show_main_menu(chat_id, user_name)
         
         return True
         
@@ -1513,9 +1471,64 @@ def process_incoming_message(chat_id, message_text, user_data):
         )
         return False
 
-
+#################################################
+#New Method
+def forward_to_existing_session(chat_id, message_text, user_data, chat_id_str, conversation_id, session):
+    """Forward message to existing session (waiting or active)"""
+    session_id = session.get('Id')
+    session_status = session.get('Status__c', 'Waiting')
+    
+    # Update user state with current session info
+    user_session_state[chat_id_str] = {
+        'in_session': True,
+        'conversation_id': conversation_id,
+        'session_id': session_id,
+        'session_status': session_status
+    }
+    
+    logger.info(f"Forwarding message to session {session_id} (status: {session_status})")
+    
+    payload = {
+        'channelType': 'Telegram',
+        'chatId': chat_id_str,
+        'message': message_text,
+        'messageId': f"TG_{int(time.time())}",
+        'firstName': user_data.get('first_name', ''),
+        'lastName': user_data.get('last_name', ''),
+        'username': user_data.get('username', ''),
+        'languageCode': user_data.get('language_code', 'en'),
+        'conversationId': conversation_id,
+        'sessionId': session_id,
+        'isSessionStart': False
+    }
+    
+    success = bot_manager.forward_to_salesforce(payload)
+    
+    # Send appropriate confirmation
+    if success:
+        if session_status == 'Waiting':
+            bot_manager.send_message(
+                chat_id,
+                "✅ *Message delivered. Waiting for agent to respond.*",
+                parse_mode='Markdown'
+            )
+        else:  # Active session
+            bot_manager.send_message(
+                chat_id,
+                "✅ *Message delivered.*",
+                parse_mode='Markdown'
+            )
+    else:
+        bot_manager.send_message(
+            chat_id,
+            "❌ *Failed to send message. Please try again.*",
+            parse_mode='Markdown'
+        )
+    
+    return success
+################################################
 def handle_existing_user(chat_id, message_text, user_data, channel_user):
-    """Handle messages from existing (registered) users"""
+    """Handle messages from existing (registered) users - SIMPLIFIED"""
     chat_id_str = str(chat_id)
     message_lower = message_text.strip().lower()
     
@@ -1533,109 +1546,59 @@ def handle_existing_user(chat_id, message_text, user_data, channel_user):
         
         # Show button menu
         user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
-        return show_main_menu(chat_id, user_name, has_active_session=False)
+        return show_main_menu(chat_id, user_name)
     
     conversation_id = conversation['Id']
     
+    # Check for ANY sessions (waiting or active)
+    any_sessions = bot_manager.get_active_sessions(conversation_id)
+    has_any_session = len(any_sessions) > 0
+    
     # Check user's current session state
     user_state = user_session_state.get(chat_id_str, {})
-    is_in_session = user_state.get('in_session', False)
-    current_session_status = user_state.get('session_status')
-    
-    # Check for actual active sessions in Salesforce
-    active_sessions = bot_manager.get_active_sessions(conversation_id)
-    has_active_salesforce_session = len(active_sessions) > 0
-    
-    # If user is marked as in session but Salesforce has no active session, reset state
-    if is_in_session and not has_active_salesforce_session:
-        user_session_state[chat_id_str] = {}
-        is_in_session = False
     
     # Handle menu commands (always show menu for these)
     if is_menu_command(message_text):
         user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
-        return show_main_menu(chat_id, user_name, has_active_salesforce_session)
+        return show_main_menu(chat_id, user_name)
     
     # Handle text commands for backward compatibility
     if message_lower in ['contact', 'support', 'contact support', 'customer support']:
         user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
-        return show_main_menu(chat_id, user_name, has_active_salesforce_session)
+        return show_main_menu(chat_id, user_name)
     
     elif message_lower in ['track', 'track case', 'case', 'my case']:
         return handle_track_case(chat_id)
     
     elif message_lower in ['new', 'new support', 'new session']:
-        # Option to start fresh session even if one exists
-        if has_active_salesforce_session:
-            confirm_keyboard = {
-                "inline_keyboard": [
-                    [{"text": "✅ Yes", "callback_data": "confirm_new_session"}],
-                    [{"text": "❌ No", "callback_data": "cancel_new_session"}]
-                ]
-            }
-            confirm_text = """
-⚠️ *You already have an active support session.*
-
-Do you want to end the current session and start a new one?
-            """
-            # Store conversation ID for callback handling
+        # User explicitly wants new session
+        success, session_id = handle_contact_support(
+            chat_id, 
+            channel_user['Id'],
+            conversation_id,
+            user_data
+        )
+        if success and session_id:
             user_session_state[chat_id_str] = {
-                'awaiting_confirmation': 'new_session',
-                'conversation_id': conversation_id
+                'in_session': True,
+                'conversation_id': conversation_id,
+                'session_id': session_id,
+                'session_status': 'Waiting'
             }
-            return bot_manager.send_message(chat_id, confirm_text, 
-                                          reply_markup=confirm_keyboard, 
-                                          parse_mode='Markdown')
-        else:
-            success, session_id = handle_contact_support(
-                chat_id, 
-                channel_user['Id'],
-                conversation_id,
-                user_data
-            )
-            if success and session_id:
-                user_session_state[chat_id_str] = {
-                    'in_session': True,
-                    'conversation_id': conversation_id,
-                    'session_id': session_id,
-                    'session_status': 'Waiting'
-                }
-            return success
+        return success
     
     elif message_lower in ['main menu', 'menu']:
         user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
-        return show_main_menu(chat_id, user_name, has_active_salesforce_session)
+        return show_main_menu(chat_id, user_name)
     
-    # Handle confirmation responses (text-based fallback)
-    if user_state.get('awaiting_confirmation') == 'new_session':
-        if message_lower == 'yes':
-            # Logic to close current session and start new one
-            user_session_state[chat_id_str] = {}
-            success, session_id = handle_contact_support(
-                chat_id, 
-                channel_user['Id'],
-                conversation_id,
-                user_data
-            )
-            if success and session_id:
-                user_session_state[chat_id_str] = {
-                    'in_session': True,
-                    'conversation_id': conversation_id,
-                    'session_id': session_id,
-                    'session_status': 'Waiting'
-                }
-            return success
-        elif message_lower == 'no':
-            user_session_state[chat_id_str] = {}
-            return handle_continue_session(chat_id, conversation_id)
-    
-    # REGULAR MESSAGE HANDLING
-    # If user is in a session (or starting one), forward message immediately
-    if is_in_session or has_active_salesforce_session:
-        return handle_message_in_session(chat_id, message_text, user_data, chat_id_str, conversation_id)
+    # REGULAR MESSAGE HANDLING - SIMPLIFIED LOGIC
+    # ALWAYS check if there's a session first
+    if has_any_session:
+        # Forward message to existing session
+        return forward_to_existing_session(chat_id, message_text, user_data, chat_id_str, conversation_id, any_sessions[0])
     else:
-        # NO ACTIVE SESSION - Show menu or auto-initiate based on message
-        return handle_message_without_session(chat_id, message_text, user_data, channel_user, conversation_id, chat_id_str)
+        # NO SESSION - create one if message looks like support request
+        return handle_message_without_session_proper(chat_id, message_text, user_data, channel_user, conversation_id, chat_id_str)
 
 
 def handle_unregistered_user(chat_id, message_text, user_data, chat_id_str, message_lower):
@@ -1678,72 +1641,25 @@ To use our support services, please register by clicking the button below.
     )
 
 
-def handle_message_in_session(chat_id, message_text, user_data, chat_id_str, conversation_id):
-    """Handle messages when user is in a session"""
-    # Get current session details
-    current_sessions = bot_manager.get_active_sessions(conversation_id)
-    if not current_sessions:
-        # No active session despite state - reset and show menu
-        user_session_state[chat_id_str] = {}
-        # We need to get channel user again to show menu
-        channel_user = bot_manager.check_existing_channel_user(chat_id_str)
-        if channel_user:
-            user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
-            return show_main_menu(chat_id, user_name, False)
-        else:
-            return show_registration_button(chat_id)
-    
-    current_session = current_sessions[0]
-    session_id = current_session.get('Id')
-    session_status = current_session.get('Status__c', 'Waiting')
-    
-    # Update user state with current session info
-    user_session_state[chat_id_str] = {
-        'in_session': True,
-        'conversation_id': conversation_id,
-        'session_id': session_id,
-        'session_status': session_status
-    }
-    
-    logger.info(f"Forwarding message to session {session_id} (status: {session_status})")
-    
-    payload = {
-        'channelType': 'Telegram',
-        'chatId': chat_id_str,
-        'message': message_text,
-        'messageId': f"TG_{int(time.time())}",
-        'firstName': user_data.get('first_name', ''),
-        'lastName': user_data.get('last_name', ''),
-        'username': user_data.get('username', ''),
-        'languageCode': user_data.get('language_code', 'en'),
-        'conversationId': conversation_id,
-        'sessionId': session_id,
-        'isSessionStart': False
-    }
-    
-    success = bot_manager.forward_to_salesforce(payload)
-    
-    # Send appropriate confirmation
-    if success:
-        if session_status == 'Waiting':
-            queue_position = bot_manager.get_queue_position(conversation_id)
-            send_message_confirmation(chat_id, success, is_session_start=False, queue_position=queue_position)
-        else:
-            send_message_confirmation(chat_id, success, is_session_start=False)
-    else:
-        send_message_confirmation(chat_id, False)
-    
-    return success
-
-
-def handle_message_without_session(chat_id, message_text, user_data, channel_user, conversation_id, chat_id_str):
-    """Handle messages when user has no active session"""
+def handle_message_without_session_proper(chat_id, message_text, user_data, channel_user, conversation_id, chat_id_str):
+    """Handle messages when there's no session at all"""
     message_lower = message_text.strip().lower()
     
-    # Allow natural conversation starters
-    if len(message_text) > 20 or '?' in message_text or 'help' in message_lower or 'issue' in message_lower or 'problem' in message_lower:
-        # This looks like a support request, auto-initiate session
-        logger.info(f"Auto-initiating session for support-like message from {chat_id}")
+    # Check if this looks like a support request
+    is_support_request = (
+        len(message_text) > 20 or 
+        '?' in message_text or 
+        'help' in message_lower or 
+        'issue' in message_lower or 
+        'problem' in message_lower or 
+        'support' in message_lower
+    )
+    
+    if is_support_request:
+        # Create new session and forward message
+        logger.info(f"Creating new session for support request from {chat_id}")
+        
+        # Create new session
         success, session_id = handle_contact_support(
             chat_id, 
             channel_user['Id'],
@@ -1777,118 +1693,26 @@ def handle_message_without_session(chat_id, message_text, user_data, channel_use
             forward_success = bot_manager.forward_to_salesforce(payload)
             
             if forward_success:
-                queue_position = bot_manager.get_queue_position(conversation_id)
-                send_message_confirmation(chat_id, True, is_session_start=True, queue_position=queue_position)
+                bot_manager.send_message(
+                    chat_id,
+                    "✅ *Message delivered. Waiting for agent to respond.*",
+                    parse_mode='Markdown'
+                )
             else:
-                send_message_confirmation(chat_id, False, is_session_start=True)
+                bot_manager.send_message(
+                    chat_id,
+                    "❌ *Failed to send message. Please try again.*",
+                    parse_mode='Markdown'
+                )
             
             return forward_success
         else:
             return success
     else:
-        # Show menu with buttons for short/ambiguous messages
-        logger.info(f"No active session for user {chat_id}, showing menu with buttons")
+        # Show menu for short/ambiguous messages
+        logger.info(f"No session and ambiguous message from {chat_id}, showing menu")
         user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
-        return show_main_menu(chat_id, user_name, has_active_session=False)
-#################################
-def handle_callback_query(callback_query):
-    """Handle inline keyboard button presses - UPDATED"""
-    try:
-        chat_id = callback_query['message']['chat']['id']
-        callback_data = callback_query['data']
-        message_id = callback_query['message']['message_id']
-        
-        # Acknowledge callback query (removes loading state)
-        bot_manager.answer_callback_query(callback_query['id'])
-        
-        # Get user data from callback query
-        user_data = callback_query.get('from', {})
-        
-        logger.info(f"Callback query from {chat_id}: {callback_data}")
-        
-        # Remove the buttons from the message that was clicked
-        bot_manager.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
-        
-        # Check if Channel_User__c exists
-        channel_user = bot_manager.check_existing_channel_user(str(chat_id))
-        
-        if not channel_user:
-            # Handle registration for new users
-            return handle_new_user_registration_callback(chat_id, callback_data, user_data)
-        
-        # Get conversation for existing users
-        conversation = bot_manager.get_active_support_conversation(channel_user['Id'])
-        if not conversation:
-            error_text = "❌ Sorry, we couldn't find your conversation."
-            bot_manager.send_message(chat_id, error_text, parse_mode='Markdown')
-            return False
-        
-        conversation_id = conversation['Id']
-        
-        # Handle different callback actions
-        if callback_data == 'contact_support':
-            success, session_id = handle_contact_support(
-                chat_id, 
-                channel_user['Id'],
-                conversation_id,
-                user_data
-            )
-            if success and session_id:
-                user_session_state[str(chat_id)] = {
-                    'in_session': True,
-                    'conversation_id': conversation_id,
-                    'session_id': session_id,
-                    'session_status': 'Waiting'
-                }
-            return success
-            
-        elif callback_data == 'track_case':
-            return handle_track_case(chat_id)
-            
-        elif callback_data == 'new_session':
-            # Option to start fresh session even if one exists
-            active_sessions = bot_manager.get_active_sessions(conversation_id)
-            if active_sessions:
-                confirm_keyboard = {
-                    "inline_keyboard": [
-                        [{"text": "✅ Yes", "callback_data": "confirm_new_session"}],
-                        [{"text": "❌ No", "callback_data": "cancel_new_session"}]
-                    ]
-                }
-                confirm_text = """
-⚠️ *You already have an active support session.*
-
-Do you want to end the current session and start a new one?
-                """
-                bot_manager.send_message(chat_id, confirm_text, 
-                                       reply_markup=confirm_keyboard, 
-                                       parse_mode='Markdown')
-                return True
-            else:
-                return handle_contact_support(chat_id, channel_user['Id'], conversation_id, user_data)
-                
-        elif callback_data == 'continue_session':
-            return handle_continue_session(chat_id, conversation_id)
-            
-        elif callback_data == 'main_menu':
-            user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
-            active_sessions = bot_manager.get_active_sessions(conversation_id)
-            has_active_session = len(active_sessions) > 0
-            return show_main_menu(chat_id, user_name, has_active_session)
-            
-        elif callback_data == 'confirm_new_session':
-            # Logic to close current session would go here
-            user_session_state[str(chat_id)] = {}
-            return handle_contact_support(chat_id, channel_user['Id'], conversation_id, user_data)
-            
-        elif callback_data == 'cancel_new_session':
-            return handle_continue_session(chat_id, conversation_id)
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"Callback query error: {e}")
-        return False
+        return show_main_menu(chat_id, user_name)
 #################################
 
 def handle_new_user_registration(chat_id, message_text, user_data):
@@ -2064,13 +1888,13 @@ def send_to_user():
         safe_chat_id = str(chat_id)
         safe_message = sanitize_input(message)
         
-        # Check if this message changes session status
-        session_status = data.get('session_status')
-        if session_status in ['Active', 'Waiting', 'Closed']:
-            user_state = user_session_state.get(safe_chat_id, {})
-            if user_state:
-                user_state['session_status'] = session_status
-                user_session_state[safe_chat_id] = user_state
+        # IMPORTANT: Clear any session state that might block message delivery
+        # This ensures Salesforce can always send messages
+        if safe_chat_id in user_session_state:
+            # Update session status if provided
+            session_status = data.get('session_status')
+            if session_status:
+                user_session_state[safe_chat_id]['session_status'] = session_status
         
         # Validate parse_mode
         parse_mode = data.get('parse_mode', 'HTML')
