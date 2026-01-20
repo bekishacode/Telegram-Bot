@@ -1475,16 +1475,41 @@ def process_incoming_message(chat_id, message_text, user_data):
         channel_user = bot_manager.check_existing_channel_user(chat_id_str)
 
         if not channel_user:
+            # User is not registered
+            
             # Check if user is in registration flow
             if chat_id_str in registration_flow:
                 # Handle registration flow
                 return handle_new_user_registration(chat_id, safe_message, user_data)
             else:
-                # Start new registration
-                return handle_new_user_registration(chat_id, safe_message, user_data)
+                # User is not registered and not in registration flow
+                # Check if this is a menu command or /start
+                if is_menu_command(safe_message) or message_lower == '/start':
+                    return handle_new_user_registration(chat_id, safe_message, user_data)
+                else:
+                    # User sent a message without being registered
+                    # Ask them to register first
+                    keyboard = {
+                        "inline_keyboard": [
+                            [{"text": "📱 Register with Phone Number", "callback_data": "register_phone"}]
+                        ]
+                    }
+                    
+                    registration_text = """
+👋 *Welcome to Bank of Abyssinia Support!*
+
+To use our support services, please register first by clicking the button below.
+                    """
+                    return bot_manager.send_message(chat_id, registration_text, 
+                                                  reply_markup=keyboard, 
+                                                  parse_mode='Markdown')
         
         # ✅ Channel User EXISTS
         logger.info(f"Existing Channel User found: {channel_user['Id']}")
+        
+        # Clear any leftover registration state
+        if chat_id_str in registration_flow:
+            registration_flow.pop(chat_id_str, None)
         
         # Get conversation for this user
         conversation = bot_manager.get_active_support_conversation(channel_user['Id'])
@@ -1517,13 +1542,7 @@ def process_incoming_message(chat_id, message_text, user_data):
             user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
             return show_main_menu(chat_id, user_name, has_active_salesforce_session)
         
-        # REMOVE THE NUMERIC MENU HANDLING SECTION AND REPLACE WITH:
-        # ========================================================
         # Handle text commands for backward compatibility
-        # ========================================================
-        
-        # Only handle text commands if they're clearly menu-related
-        # Otherwise, treat them as regular messages
         if message_lower in ['contact', 'support', 'contact support', 'customer support']:
             # For text commands, show the menu with buttons
             user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
@@ -1598,9 +1617,7 @@ Do you want to end the current session and start a new one?
                 user_session_state[chat_id_str] = {}
                 return handle_continue_session(chat_id, conversation_id)
         
-        # ========================================================
         # REGULAR MESSAGE HANDLING
-        # ========================================================
         # If user is in a session (or starting one), forward message immediately
         if is_in_session or has_active_salesforce_session:
             # Get current session details
@@ -1722,6 +1739,24 @@ def handle_new_user_registration(chat_id, message_text, user_data):
     """Handle new user registration (separated for clarity)"""
     chat_id_str = str(chat_id)
     message_lower = message_text.strip().lower()
+    
+    # FIRST: Check if user is already registered (in case registration just completed)
+    channel_user = bot_manager.check_existing_channel_user(chat_id_str)
+    if channel_user:
+        # User is already registered, skip registration flow
+        logger.info(f"User {chat_id} is already registered, skipping registration")
+        
+        # Clear any registration state
+        registration_flow.pop(chat_id_str, None)
+        
+        # Get conversation and show main menu
+        conversation = bot_manager.get_active_support_conversation(channel_user['Id'])
+        if conversation:
+            user_name = channel_user.get('Contact__r', {}).get('FirstName') or user_data.get('first_name')
+            return show_main_menu(chat_id, user_name, has_active_session=False)
+        else:
+            # No conversation found, show generic menu
+            return show_main_menu(chat_id, None, has_active_session=False)
     
     # Check if user is in registration flow
     registration_state = registration_flow.get(chat_id_str, {})
